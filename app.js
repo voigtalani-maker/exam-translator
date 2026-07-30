@@ -192,9 +192,11 @@ function isKeep(text){
   const t = text.trim(); if(!t) return true;
   // multiple-choice / list labels: A  B.  (C)  D)  (i)  1.  a)  — keep exactly
   if(/^[\(\[]?[A-Za-z0-9]{1,3}[\)\].:]?$/.test(t)) return true;
+  // chemistry state symbols (s) (g) (aq) (ℓ) — it's an equation chunk, keep exactly
+  if(/\((s|g|aq|ℓ|l)\)/.test(t)) return true;
   const words = (t.match(/[A-Za-zÀ-ÿ]{2,}/g)||[]);
   if(words.length===0) return true;                 // pure numbers/symbols/formulas
-  const mathy = /[=×÷±∆Δ→←↔≈≤≥∑√°∫∞]/.test(t);
+  const mathy = /[=+×÷±∆Δ→←↔⇌≈≤≥∑√°∫∞·]/.test(t);
   if(words.length<=1 && (mathy || /\d/.test(t))) return true;
   return false;
 }
@@ -236,6 +238,25 @@ async function translateBlock(srcText, dir){
   if(exact!==null) return {mode:'gloss', text:exact};
   const r = await mtTranslate(trimmed, dir);
   return {mode:'mt', text:r.text, hints:glossaryHints(trimmed,dir), failed:!!r.failed};
+}
+// translate a unit that may contain special parts (super/subscript, formulas):
+// normal parts are translated each in their own slot; special parts are kept
+// verbatim and their ORIGINAL ink is never touched.
+async function translateUnit(u, dir){
+  const src = u.src!=null ? u.src : u.str;
+  if(!u.parts || !u.parts.some(p=>p.special)) return await translateBlock(src, dir);
+  const outParts=[]; let anyMt=false, anyGloss=false, failed=false; const hints=[];
+  for(const p of u.parts){
+    if(p.special || isKeep(p.t)){ outParts.push({t:p.t, x:p.x, w:p.w, special:p.special, kept:true}); continue; }
+    const tr = await translateBlock(p.t, dir);
+    const unchanged = (tr.text||'').trim() === p.t.trim();   // translation identical -> keep original ink
+    if(!unchanged){ if(tr.mode==='mt') anyMt=true; else if(tr.mode==='gloss') anyGloss=true; }
+    if(tr.failed) failed=true;
+    if(tr.hints) hints.push(...tr.hints);
+    outParts.push({t:tr.text, x:p.x, w:p.w, special:false, kept: tr.mode==='keep' || unchanged});
+  }
+  return { mode: anyMt?'mt':(anyGloss?'gloss':'keep'),
+           text: outParts.map(p=>p.t).join(''), parts:outParts, hints, failed };
 }
 
 /* ---------------- PDF / image extraction ---------------- */
@@ -424,9 +445,23 @@ function groupLines(items, styles){
     const x = Math.min(...s.items.map(i=>i.x));
     const right = Math.max(...s.items.map(i=>i.x + i.w));
     const ys = s.items.map(i=>i.y).sort((a,b)=>a-b);
+    const baseY = ys[Math.floor(ys.length/2)];
+    // main text size = biggest size actually ON the baseline (not a heading in
+    // another column) — fixes wrong text sizes in tables
+    const baseItems = s.items.filter(i=>Math.abs(i.y-baseY)<=1);
+    const mainSize = Math.max(...(baseItems.length?baseItems:s.items).map(i=>i.size));
+    // split into parts: normal text vs super/subscript (smaller and/or offset
+    // from the baseline). Special parts keep their ORIGINAL ink — never redrawn.
+    const parts=[]; let cur=null;
+    s.items.forEach(it=>{
+      const special = (it.size < mainSize*0.82) || (Math.abs(it.y - baseY) > mainSize*0.12);
+      if(cur && cur.special===special){ cur.t+=it.str; cur.right=Math.max(cur.right, it.x+it.w); }
+      else { cur={t:it.str, x:it.x, right:it.x+it.w, special}; parts.push(cur); }
+    });
+    parts.forEach(p=>{ p.w=Math.max(p.right-p.x,2); delete p.right; });
     const fam = styles && s.items[0] && styles[s.items[0].fn] && styles[s.items[0].fn].fontFamily;
-    return { x, y: ys[Math.floor(ys.length/2)], size:s.size, width: Math.max(right-x, 4),
-             str: s.items.map(i=>i.str).join(''), serif: fontIsSerif(fam) };
+    return { x, y: baseY, size:mainSize, width: Math.max(right-x, 4),
+             str: parts.map(p=>p.t).join(''), parts, serif: fontIsSerif(fam) };
   }).filter(l=>l.str.trim()).sort((a,b)=> b.y - a.y || a.x - b.x);
 }
 async function extractPdfOverlay(file, onNote, onProgress){
@@ -625,7 +660,7 @@ async function handleFiles(files){
     const units = collectUnits(doc);
     let total=units.length, done=0, failed=0;
     for(const u of units){
-      u.tr = await translateBlock(u.src, row.direction);
+      u.tr = await translateUnit(u, row.direction);
       if(u.tr.failed) failed++;
       done++; setBar(0.5 + (done/Math.max(1,total))*0.5);
       procNote(`Translating… (${done}/${total})`);
@@ -777,12 +812,12 @@ async function buildDocx(){
 }
 // ---- PDF overlay: keep original page, cover each translated line, redraw in place ----
 function sanitizePdfText(s){
+  // °C, ×, ÷, ², ³, ±, é, ë … are all WinAnsi-encodable — keep them exactly.
   return (s||'')
-    .replace(/[“”]/g,'"').replace(/[‘’]/g,"'")
-    .replace(/[–—]/g,'-').replace(/…/g,'...')
-    .replace(/×/g,'x').replace(/÷/g,'/')
-    .replace(/²/g,'2').replace(/³/g,'3')
-    .replace(/°/g,' deg').replace(/→/g,'->')
+    .replace(/[₀-₉]/g, c=>String.fromCharCode(c.charCodeAt(0)-0x2050)) // ₀-₉ -> 0-9
+    .replace(/⁰/g,'0').replace(/[⁴-⁹]/g, c=>String.fromCharCode(c.charCodeAt(0)-0x2040)) // ⁰,⁴-⁹
+    .replace(/→/g,'->').replace(/←/g,'<-')
+    .replace(/[Δ∆]/g,'D')                    // only hits the flat fallback; kept parts keep original ink
     .replace(/[\x00-\x1F]/g,' ')
     .replace(/[^\x20-\xFF]/g,'');            // drop anything Helvetica/WinAnsi can't encode
 }
@@ -797,16 +832,24 @@ async function buildOverlayPdf(){
     pg.lines.forEach(ln=>{
       const tr = ln.tr; if(!tr) return;
       if(tr.mode==='keep' && !tr.edited) return;               // leave numbers/formulas untouched
-      const text = sanitizePdfText(tr.text||''); if(!text.trim()) return;
+      if(!tr.edited && (tr.text||'').trim()===ln.str.trim()) return; // translation identical -> original ink stays
       const font = ln.serif ? serif : sans;
-      // cover ONLY this segment's text (tight box — never crosses a table border),
-      // then redraw the translation in the same slot
-      page.drawRectangle({ x: ln.x-0.5, y: ln.y - ln.size*0.22, width: ln.width+1, height: ln.size*1.22, color: rgb(1,1,1) });
-      let size = ln.size || 10;
-      const maxW = Math.max(ln.width, 6);
-      const w = font.widthOfTextAtSize(text, size);
-      if(w > maxW) size = Math.max(4, size * maxW / w);
-      page.drawText(text, { x: ln.x, y: ln.y, size, font, color: rgb(0,0,0) });
+      const drawSlot = (text, x, w0, baseSize)=>{            // cover one slot, redraw text inside it
+        text = sanitizePdfText(text); if(!text.trim()) return;
+        page.drawRectangle({ x: x-0.5, y: ln.y - baseSize*0.22, width: w0+1, height: baseSize*1.22, color: rgb(1,1,1) });
+        let size = baseSize || 10;
+        const maxW = Math.max(w0, 6);
+        const w = font.widthOfTextAtSize(text, size);
+        if(w > maxW) size = Math.max(4, size * maxW / w);
+        page.drawText(text, { x, y: ln.y, size, font, color: rgb(0,0,0) });
+      };
+      if(tr.parts && !tr.edited){
+        // per-part: translated words replaced in their own slot; kept/special
+        // parts (formulas, sub/superscripts, °C, ΔH…) keep their ORIGINAL ink
+        tr.parts.forEach(p=>{ if(p.kept || p.special) return; drawSlot(p.t, p.x, p.w, ln.size); });
+      }else{
+        drawSlot(tr.text||'', ln.x, ln.width, ln.size);      // edited by hand → whole-line replace
+      }
     });
   });
   const out = await pdf.save();
@@ -995,7 +1038,7 @@ function wire(){
 }
 
 /* ---------------- test hook (no-login engine testing) ---------------- */
-window.EPT = { extractDocument, translateBlock, mtTranslate, isKeep, buildTextBlocks, runsToText,
+window.EPT = { extractDocument, translateBlock, translateUnit, mtTranslate, isKeep, buildTextBlocks, runsToText,
   buildDocxFor: async (doc)=>{ CURRENT={_doc:doc, name:'test', id:'test'}; return await buildDocx(); },
   buildOverlayFor: async (doc)=>{ CURRENT={_doc:doc, name:'test', id:'test'}; return await buildOverlayPdf(); },
   buildInplaceFor: async (doc)=>{ CURRENT={_doc:doc, name:'test', id:'test'}; return await buildDocxInplace(); },
