@@ -1,0 +1,10 @@
+# real papers + test harnesses used only for local testing — never commit/publish
+sample.pdf
+sample.docx
+sample.*
+test.html
+test-docx.html
+test-*.html
+.claude/settings.local.json
+.DS_Store
+Thumbs.db

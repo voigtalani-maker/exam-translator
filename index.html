@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Exam Paper Translator</title>
+<meta name="theme-color" content="#1f5fa8">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon-180.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ===== TOP BAR ===== -->
+<header class="topbar hidden" id="topbar">
+  <div class="logo"><span class="mark">⇄</span> Exam Translator</div>
+  <nav>
+    <button data-nav="library" class="active">Library</button>
+    <button data-nav="new">New Paper</button>
+    <button data-nav="glossary">Glossary</button>
+  </nav>
+  <div class="spacer"></div>
+  <div class="who"><span id="whoEmail"></span><button id="logoutBtn">Log out</button></div>
+</header>
+
+<!-- ===== AUTH ===== -->
+<section id="screen-auth" class="auth-screen">
+  <div class="card auth-card">
+    <h1>Exam Paper Translator</h1>
+    <p class="sub">Translate question papers English ⟷ Afrikaans, keeping the science intact.</p>
+    <div id="authErr" class="auth-err hidden"></div>
+    <div class="fldwrap"><label class="fld">Username</label><input type="text" id="authEmail" autocomplete="username" placeholder="Elizabeth"></div>
+    <div class="fldwrap"><label class="fld">Password</label><input type="password" id="authPass" autocomplete="current-password"></div>
+    <button class="btn" id="authBtn" style="width:100%">Log in</button>
+  </div>
+</section>
+
+<!-- ===== APP ===== -->
+<main id="app" class="hidden">
+
+  <!-- LIBRARY -->
+  <section id="screen-library" class="wrap">
+    <div class="page-head">
+      <h2>Document Library</h2><div class="spacer"></div>
+      <button class="btn" data-nav="new">+ New Paper</button>
+    </div>
+    <div class="filters">
+      <div class="f"><label>Subject</label><select id="fSubject"><option value="">All subjects</option></select></div>
+      <div class="f"><label>Grade</label><select id="fGrade"><option value="">All grades</option></select></div>
+      <div class="f"><label>Paper type</label><select id="fType"><option value="">All types</option></select></div>
+      <div class="f"><label>Exam period</label><select id="fPeriod"><option value="">All periods</option></select></div>
+      <div class="search"><label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px">Search</label><input type="text" id="fSearch" placeholder="Search by name or year…"></div>
+    </div>
+    <div id="libList" class="lib-grid"></div>
+  </section>
+
+  <!-- NEW PAPER / WORKFLOW -->
+  <section id="screen-new" class="wrap hidden">
+    <div class="steps" id="steps">
+      <div class="st active" data-step="upload"><span class="n">1</span> Upload</div>
+      <div class="st" data-step="process"><span class="n">2</span> Read &amp; translate</div>
+      <div class="st" data-step="review"><span class="n">3</span> Review</div>
+      <div class="st" data-step="export"><span class="n">4</span> Export</div>
+    </div>
+
+    <!-- step: upload -->
+    <div id="step-upload">
+      <div class="card" style="padding:20px">
+        <div class="row" style="margin-bottom:16px">
+          <div><label class="fld">Translation direction</label>
+            <select id="uDirection">
+              <option value="en_af">English → Afrikaans</option>
+              <option value="af_en">Afrikaans → English</option>
+            </select></div>
+          <div><label class="fld">Subject</label><select id="uSubject"></select></div>
+          <div><label class="fld">Grade</label><select id="uGrade"></select></div>
+        </div>
+        <div class="row" style="margin-bottom:16px">
+          <div><label class="fld">Paper type</label><select id="uType"></select></div>
+          <div><label class="fld">Exam period</label><select id="uPeriod"></select></div>
+          <div><label class="fld">Year</label><input type="text" id="uYear" inputmode="numeric" placeholder="e.g. 2023" maxlength="4"></div>
+        </div>
+        <div class="row" style="margin-bottom:16px">
+          <div style="flex:2"><label class="fld">Paper name / label (optional)</label><input type="text" id="uName" placeholder="e.g. Paper 1 — Mid-year"></div>
+        </div>
+        <div class="dropzone" id="dropzone">
+          <div class="big">📄</div>
+          <h3>Drop a PDF, Word document, or images here</h3>
+          <p class="muted">or click to choose a file — PDF (.pdf), Word (.docx) and images all work</p>
+          <input type="file" id="fileInput" accept=".pdf,application/pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/*" multiple class="hidden">
+        </div>
+        <p class="muted" style="font-size:12.5px;margin:12px 2px 0">The original is saved to your library the moment it uploads — nothing is lost even if you close the app.</p>
+      </div>
+    </div>
+
+    <!-- step: process -->
+    <div id="step-process" class="hidden">
+      <div class="card" style="padding:22px">
+        <h3 style="margin:0 0 14px">Reading &amp; translating…</h3>
+        <div class="bar" style="margin-bottom:16px"><i id="procBar"></i></div>
+        <div id="procLog"></div>
+      </div>
+    </div>
+
+    <!-- step: review -->
+    <div id="step-review" class="hidden">
+      <div class="review-head">
+        <h3 style="margin:0">Review translation</h3>
+        <span class="pill grey" id="reviewName"></span>
+        <div class="spacer"></div>
+        <div class="legend">
+          <span><span class="sw" style="background:var(--ok)"></span>Glossary (verified)</span>
+          <span><span class="sw" style="background:var(--warn)"></span>Machine — please check</span>
+          <span><span class="sw" style="background:#9aa8ba"></span>Kept as-is (numbers/formulas)</span>
+        </div>
+      </div>
+      <p class="muted" style="margin:0 0 14px;font-size:13.5px">Yellow blocks are machine-translated and need a glance. Click any translated block to edit it. Green blocks came straight from your confirmed glossary.</p>
+      <div id="reviewPages" class="pagewrap"></div>
+      <div style="display:flex;gap:10px;margin-top:22px;flex-wrap:wrap">
+        <button class="btn ghost" id="backToLibBtn">Save &amp; close</button>
+        <div class="spacer" style="flex:1"></div>
+        <button class="btn" id="exportBtn">Export Word document (.docx)</button>
+      </div>
+    </div>
+
+    <!-- step: export/done -->
+    <div id="step-export" class="hidden">
+      <div class="card" style="padding:30px;text-align:center">
+        <div style="font-size:44px;margin-bottom:8px">✅</div>
+        <h3 style="margin:0 0 6px">Done!</h3>
+        <p class="muted" style="margin:0 0 20px">Your translated Word document is saved to the library.</p>
+        <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+          <button class="btn ghost" id="dlAgainBtn">Download again</button>
+          <button class="btn" data-nav="library">Back to library</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section id="screen-glossary" class="wrap hidden">
+    <div class="page-head"><h2>Glossary</h2><div class="spacer"></div><button class="btn" id="addTermBtn">+ Add term</button></div>
+    <p class="muted" style="margin:-6px 0 16px;font-size:13.5px">Confirmed English⟷Afrikaans terms. These are used first when translating, so anything here is always translated your way.</p>
+    <div class="gloss-toolbar">
+      <div style="flex:1;min-width:200px"><input type="text" id="gSearch" placeholder="Search terms…"></div>
+      <div style="min-width:160px"><select id="gSubjectFilter"><option value="">All subjects</option></select></div>
+    </div>
+    <table class="gloss"><thead><tr><th>English</th><th>Afrikaans</th><th>Subject</th><th>Source</th><th></th></tr></thead>
+      <tbody id="glossBody"></tbody></table>
+  </section>
+
+</main>
+
+<div class="toast-host" id="toastHost"></div>
+<div id="modalRoot"></div>
+
+<!-- libraries (all free, CDN) -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

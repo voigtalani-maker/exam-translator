@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Shared paper — Exam Translator</title>
+<meta name="theme-color" content="#1f5fa8">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar" style="position:static">
+  <div class="logo"><span class="mark">⇄</span> Exam Translator</div>
+</header>
+<div class="wrap" style="max-width:560px">
+  <div id="loading" class="progress-line"><span class="spinner"></span> Loading…</div>
+  <div id="notfound" class="card hidden" style="padding:30px;text-align:center">
+    <div style="font-size:40px;margin-bottom:8px">🔒</div>
+    <h2 style="margin:0 0 6px">Link not available</h2>
+    <p class="muted">This share link is invalid or has been turned off by the teacher.</p>
+  </div>
+  <div id="paper" class="card hidden" style="padding:26px">
+    <h2 id="pname" style="margin:0 0 10px"></h2>
+    <div class="tags" id="ptags" style="margin-bottom:18px"></div>
+    <p class="muted" style="margin:0 0 16px;font-size:13.5px">Downloads shared by your teacher. View or download only.</p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <a id="dlOrig" class="btn ghost hidden" download>⬇ Download original</a>
+      <a id="dlTrans" class="btn hidden" download>⬇ Download translated</a>
+    </div>
+  </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script>
+const sb = window.supabase.createClient(
+  'https://hontxqtggrvxybamqrnh.supabase.co',
+  'sb_publishable__gdf9hPZ-q7LUOkpcwkyLg_6wUW0N3y');
+const token = new URLSearchParams(location.search).get('t');
+const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
+function show(id){ document.getElementById(id).classList.remove('hidden'); document.getElementById('loading').classList.add('hidden'); }
+(async ()=>{
+  if(!token){ show('notfound'); return; }
+  const { data, error } = await sb.rpc('ext_get_shared_paper', { p_token: token });
+  const p = data && data[0];
+  if(error || !p){ show('notfound'); return; }
+  document.getElementById('pname').textContent = p.name || 'Shared paper';
+  const dir = p.direction==='en_af'?'EN → AF':p.direction==='af_en'?'AF → EN':'';
+  document.getElementById('ptags').innerHTML =
+    [p.subject && `<span class="pill">${esc(p.subject)}</span>`,
+     p.grade && `<span class="pill grey">Gr ${esc(p.grade)}</span>`,
+     p.paper_type && `<span class="pill grey">${esc(p.paper_type)}</span>`,
+     dir && `<span class="pill grey">${dir}</span>`].filter(Boolean).join(' ');
+  if(p.original_url){ const a=document.getElementById('dlOrig'); a.href=p.original_url; a.classList.remove('hidden'); }
+  if(p.translated_url){ const a=document.getElementById('dlTrans'); a.href=p.translated_url; a.classList.remove('hidden'); }
+  show('paper');
+})();
+</script>
+</body>
+</html>
