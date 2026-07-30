@@ -373,7 +373,62 @@ async function extractDocx(file, onNote){
   const arrayBuffer = await file.arrayBuffer();
   const { value:html } = await mammoth.convertToHtml({arrayBuffer});
   const wrap = document.createElement('div'); wrap.innerHTML = html;
-  return { pages:[{ index:1, blocks: htmlToBlocks(wrap), pageImage:null, scanned:false }] };
+  return { mode:'reflow', pages:[{ index:1, blocks: htmlToBlocks(wrap), pageImage:null, scanned:false }] };
+}
+
+// ---- PDF: line geometry so we can overlay translated text in place (keeps original page exactly) ----
+// pdf.js text item.transform[4],[5] are already in PDF user space (bottom-left origin),
+// which matches pdf-lib's coordinate system directly — no flip needed.
+function groupLines(items){
+  const arr = items.map(it=>({
+    x: it.transform[4], y: it.transform[5],
+    size: Math.hypot(it.transform[2], it.transform[3]) || it.height || 10,
+    w: it.width || 0, str: it.str
+  })).filter(a=>a.str && a.str.length);
+  const lines=[];
+  arr.forEach(a=>{
+    let ln = lines.find(l=> Math.abs(l.baseY - a.y) < Math.max(1.5, l.size*0.4));
+    if(!ln){ ln={baseY:a.y, size:a.size, items:[]}; lines.push(ln); }
+    ln.items.push(a); ln.size=Math.max(ln.size, a.size);
+  });
+  return lines.map(l=>{
+    l.items.sort((p,q)=>p.x-q.x);
+    const x = Math.min(...l.items.map(i=>i.x));
+    const right = Math.max(...l.items.map(i=>i.x + i.w));
+    const ys = l.items.map(i=>i.y).sort((a,b)=>a-b);
+    return { x, y: ys[Math.floor(ys.length/2)], size:l.size, width: Math.max(right-x, 4), str: l.items.map(i=>i.str).join('') };
+  }).filter(l=>l.str.trim()).sort((a,b)=> b.y - a.y);
+}
+async function extractPdfOverlay(file, onNote, onProgress){
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const pdf = await pdfjsLib.getDocument({data: bytes.slice(0)}).promise;   // slice keeps `bytes` for pdf-lib
+  const pages=[]; let digitalPages=0;
+  for(let p=1;p<=pdf.numPages;p++){
+    onNote && onNote(`Reading page ${p} of ${pdf.numPages}…`);
+    const page = await pdf.getPage(p);
+    const vp = page.getViewport({scale:1});
+    const tc = await page.getTextContent();
+    const items = tc.items.filter(i=>i.str && i.str.length);
+    if(items.length>3) digitalPages++;
+    pages.push({ index:p, width:vp.width, height:vp.height, lines: groupLines(items) });
+    onProgress && onProgress(p/pdf.numPages*0.5);
+  }
+  return { mode:'pdf-overlay', bytes, pages, digital: digitalPages>0 };
+}
+async function extractPdfReflowOcr(file, onNote, onProgress){
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({data:buf}).promise;
+  const pages=[];
+  for(let p=1;p<=pdf.numPages;p++){
+    const page = await pdf.getPage(p);
+    const viewport = page.getViewport({scale:2});
+    const canvas=document.createElement('canvas'); canvas.width=viewport.width; canvas.height=viewport.height;
+    await page.render({canvasContext:canvas.getContext('2d'), viewport}).promise;
+    const txt = await ocrCanvas(canvas, onNote);
+    pages.push({index:p, blocks: ocrToBlocks(txt), pageImage: canvas.toDataURL('image/jpeg',0.65), scanned:true});
+    onProgress && onProgress(p/pdf.numPages*0.5);
+  }
+  return {mode:'reflow', pages};
 }
 
 async function extractDocument(file, onNote, onProgress){
@@ -381,44 +436,21 @@ async function extractDocument(file, onNote, onProgress){
   const isDocx = /\.docx$/i.test(file.name) || file.type==='application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   if(/\.doc$/i.test(file.name) && !isDocx) throw new Error('Old .doc files aren’t supported — please save it as .docx or PDF first.');
   if(isDocx){ const d = await extractDocx(file, onNote); onProgress && onProgress(0.5); return d; }
-  const pages=[];
   if(isPdf){
-    const buf = await file.arrayBuffer();
-    const pdf = await pdfjsLib.getDocument({data:buf}).promise;
-    for(let p=1;p<=pdf.numPages;p++){
-      onNote && onNote(`Reading page ${p} of ${pdf.numPages}…`);
-      const page = await pdf.getPage(p);
-      const viewport = page.getViewport({scale:2});
-      const canvas=document.createElement('canvas');
-      canvas.width=viewport.width; canvas.height=viewport.height;
-      await page.render({canvasContext:canvas.getContext('2d'), viewport}).promise;
-      const tc = await page.getTextContent();
-      let blocks;
-      const digital = tc.items.filter(i=>i.str && i.str.trim()).length > 4;
-      if(digital){
-        blocks = buildTextBlocks(tc);
-        const imgs = await detectImages(page, viewport, canvas);
-        // append images after text (kept in library page image for exact context)
-        blocks = blocks.concat(imgs);
-      }else{
-        const txt = await ocrCanvas(canvas, onNote);
-        blocks = ocrToBlocks(txt);
-      }
-      pages.push({index:p, blocks, pageImage: canvas.toDataURL('image/jpeg',0.65), scanned: !digital});
-      onProgress && onProgress(p/pdf.numPages*0.5);
-    }
-  }else{
-    // image file(s)
-    onNote && onNote('Reading image…');
-    const url = URL.createObjectURL(file);
-    const img = await new Promise((res,rej)=>{const i=new Image(); i.onload=()=>res(i); i.onerror=rej; i.src=url;});
-    const canvas=document.createElement('canvas'); canvas.width=img.width; canvas.height=img.height;
-    canvas.getContext('2d').drawImage(img,0,0);
-    const txt = await ocrCanvas(canvas, onNote);
-    pages.push({index:1, blocks: ocrToBlocks(txt), pageImage: canvas.toDataURL('image/jpeg',0.65), scanned:true});
-    onProgress && onProgress(0.5);
+    const ov = await extractPdfOverlay(file, onNote, onProgress);
+    if(ov.digital) return ov;                                    // digital PDF → faithful in-place overlay
+    onNote && onNote('No text layer found — using OCR (rougher, layout not preserved)…');
+    return await extractPdfReflowOcr(file, onNote, onProgress);   // scanned PDF → OCR reflow fallback
   }
-  return {pages};
+  // image file → OCR reflow
+  onNote && onNote('Reading image…');
+  const url = URL.createObjectURL(file);
+  const img = await new Promise((res,rej)=>{const i=new Image(); i.onload=()=>res(i); i.onerror=rej; i.src=url;});
+  const canvas=document.createElement('canvas'); canvas.width=img.width; canvas.height=img.height;
+  canvas.getContext('2d').drawImage(img,0,0);
+  const txt = await ocrCanvas(canvas, onNote);
+  onProgress && onProgress(0.5);
+  return {mode:'reflow', pages:[{index:1, blocks: ocrToBlocks(txt), pageImage: canvas.toDataURL('image/jpeg',0.65), scanned:true}]};
 }
 
 /* ---------------- workflow ---------------- */
@@ -485,18 +517,18 @@ async function handleFiles(files){
     await sb.from('ext_papers').update(tags).eq('id', row.id);
     Object.assign(CURRENT, tags);
 
-    // 4) translate
+    // 4) translate (unit = a PDF line for overlay, or a text block for reflow)
     procNote('Translating…');
-    let total=0, done=0, hitLimit=false;
-    doc.pages.forEach(pg=> pg.blocks.forEach(b=>{ if(b.type==='text') total++; }));
-    for(const pg of doc.pages){
-      for(const b of pg.blocks){
-        if(b.type!=='text'){ continue; }
-        b.tr = await translateBlock(runsToText(b.runs), row.direction);
-        if(b.tr.limit) hitLimit=true;
-        done++; setBar(0.5 + (done/Math.max(1,total))*0.5);
-        procNote(`Translating… (${done}/${total})`);
-      }
+    const overlay = doc.mode==='pdf-overlay';
+    const units=[];
+    doc.pages.forEach(pg=> (overlay ? pg.lines : pg.blocks.filter(b=>b.type==='text')).forEach(u=>units.push(u)));
+    let total=units.length, done=0, hitLimit=false;
+    for(const u of units){
+      const src = overlay ? u.str : runsToText(u.runs);
+      u.tr = await translateBlock(src, row.direction);
+      if(u.tr.limit) hitLimit=true;
+      done++; setBar(0.5 + (done/Math.max(1,total))*0.5);
+      procNote(`Translating… (${done}/${total})`);
     }
     procDone('Translation ready for review');
     if(hitLimit) toast('The free translation service hit its daily limit on some text — those blocks are left in the original language for you to edit.','err');
@@ -517,8 +549,13 @@ function readFormTags(file){
     year: $('#uYear').value.trim()||null
   };
 }
+function pageText(doc, i){
+  const pg = doc.pages[i]; if(!pg) return '';
+  if(doc.mode==='pdf-overlay') return (pg.lines||[]).map(l=>l.str).join(' ');
+  return (pg.blocks||[]).filter(b=>b.type==='text').map(b=>runsToText(b.runs)).join(' ');
+}
 function autoDetectTags(doc){
-  const text = (doc.pages[0]?.blocks||[]).filter(b=>b.type==='text').map(b=>runsToText(b.runs)).join(' ').toLowerCase();
+  const text = pageText(doc,0).toLowerCase();
   const set=(id,val)=>{ const s=$(id); if(!s.value && val){ s.value=val; s.style.outline='2px solid var(--warn)'; setTimeout(()=>s.style.outline='',2500);} };
   let subj='';
   if(/chem|chemie/.test(text)) subj='Chemistry';
@@ -548,34 +585,37 @@ function autoDetectTags(doc){
 
 /* ---------------- review ---------------- */
 function renderReview(){
+  const doc = CURRENT._doc;
+  const overlay = doc.mode==='pdf-overlay';
   $('#reviewName').textContent = CURRENT.name || CURRENT.original_filename;
+  $('#exportBtn').textContent = overlay ? 'Export translated PDF' : 'Export Word document (.docx)';
   const host = $('#reviewPages'); host.innerHTML='';
-  CURRENT._doc.pages.forEach(pg=>{
+  doc.pages.forEach(pg=>{
     const card = el('div','card pagecard');
     card.appendChild(el('div','phead', `Page ${pg.index}${pg.scanned?' · scanned (OCR)':''}`));
     const sbs = el('div','sbs');
     const orig = el('div','col orig'); orig.appendChild(el('h4',null,'Original'));
     const trc  = el('div','col'); trc.appendChild(el('h4',null,'Translated'));
-    pg.blocks.forEach((b,bi)=>{
-      if(b.type==='image'){
-        const o=el('div','blk imgblk'); o.innerHTML=`<img class="diagram" src="${b.dataUrl}">`; orig.appendChild(o);
-        const t=el('div','blk imgblk'); t.innerHTML=`<img class="diagram" src="${b.dataUrl}"><div class="muted" style="font-size:11px;margin-top:4px">Diagram — kept as-is</div>`; trc.appendChild(t);
+    const units = overlay ? pg.lines : pg.blocks;
+    units.forEach(u=>{
+      if(!overlay && u.type==='image'){
+        const o=el('div','blk imgblk'); o.innerHTML=`<img class="diagram" src="${u.dataUrl}">`; orig.appendChild(o);
+        const t=el('div','blk imgblk'); t.innerHTML=`<img class="diagram" src="${u.dataUrl}"><div class="muted" style="font-size:11px;margin-top:4px">Diagram — kept as-is</div>`; trc.appendChild(t);
         return;
       }
-      // original
-      const ob = el('div','blk orig-blk'); ob.innerHTML = runsToHtml(b.runs); orig.appendChild(ob);
-      // translated
-      const mode = b.tr.mode; // gloss / mt / keep
+      const srcText = overlay ? u.str : runsToText(u.runs);
+      const ob = el('div','blk orig-blk'); ob.innerHTML = overlay ? esc(u.str) : runsToHtml(u.runs); orig.appendChild(ob);
+      const tr = u.tr || (u.tr = {mode:'keep', text:srcText});
+      const mode = tr.mode;
       const tb = el('div','blk tr '+mode);
-      const tag = mode==='gloss'?'Glossary':mode==='mt'?'Machine — check':'Kept as-is';
-      tb.appendChild(el('span','htag',tag));
+      tb.appendChild(el('span','htag', mode==='gloss'?'Glossary':mode==='mt'?'Machine — check':'Kept as-is'));
       const body = el('div'); body.contentEditable='true'; body.spellcheck=false;
-      body.textContent = b.tr.text;
+      body.textContent = tr.text!=null ? tr.text : srcText;
       body.style.minHeight='1.2em';
-      body.addEventListener('input', ()=>{ b.tr.text = body.textContent; b.tr.edited=true; });
+      body.addEventListener('input', ()=>{ tr.text = body.textContent; tr.edited=true; });
       tb.appendChild(body);
-      if(mode==='mt' && b.tr.hints && b.tr.hints.length){
-        tb.appendChild(el('div','hints','Glossary suggests: '+b.tr.hints.map(esc).join(' · ')));
+      if(mode==='mt' && tr.hints && tr.hints.length){
+        tb.appendChild(el('div','hints','Glossary suggests: '+tr.hints.map(esc).join(' · ')));
       }
       trc.appendChild(tb);
     });
@@ -620,32 +660,72 @@ async function buildDocx(){
   const doc = new D.Document({ sections:[{ properties:{}, children }] });
   return await D.Packer.toBlob(doc);
 }
-async function exportDocx(){
+// ---- PDF overlay: keep original page, cover each translated line, redraw in place ----
+function sanitizePdfText(s){
+  return (s||'')
+    .replace(/[“”]/g,'"').replace(/[‘’]/g,"'")
+    .replace(/[–—]/g,'-').replace(/…/g,'...')
+    .replace(/×/g,'x').replace(/÷/g,'/')
+    .replace(/²/g,'2').replace(/³/g,'3')
+    .replace(/°/g,' deg').replace(/→/g,'->')
+    .replace(/[\x00-\x1F]/g,' ')
+    .replace(/[^\x20-\xFF]/g,'');            // drop anything Helvetica/WinAnsi can't encode
+}
+async function buildOverlayPdf(){
+  const { PDFDocument, StandardFonts, rgb } = PDFLib;
+  const pdf = await PDFDocument.load(CURRENT._doc.bytes);
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const pages = pdf.getPages();
+  CURRENT._doc.pages.forEach(pg=>{
+    const page = pages[pg.index-1]; if(!page) return;
+    pg.lines.forEach(ln=>{
+      const tr = ln.tr; if(!tr) return;
+      if(tr.mode==='keep' && !tr.edited) return;               // leave numbers/formulas untouched
+      const text = sanitizePdfText(tr.text||''); if(!text.trim()) return;
+      // cover the original line with a white box
+      page.drawRectangle({ x: ln.x-1, y: ln.y - ln.size*0.28, width: ln.width+2, height: ln.size*1.34, color: rgb(1,1,1) });
+      // fit translated text into the original line width
+      let size = ln.size || 10;
+      const maxW = Math.max(ln.width, 6);
+      const w = font.widthOfTextAtSize(text, size);
+      if(w > maxW) size = Math.max(4, size * maxW / w);
+      page.drawText(text, { x: ln.x, y: ln.y, size, font, color: rgb(0,0,0) });
+    });
+  });
+  const out = await pdf.save();
+  return new Blob([out], { type:'application/pdf' });
+}
+
+async function exportTranslated(){
+  const overlay = CURRENT._doc.mode==='pdf-overlay';
+  const label = overlay ? 'Export translated PDF' : 'Export Word document (.docx)';
   $('#exportBtn').disabled=true; $('#exportBtn').textContent='Building…';
   try{
-    const blob = await buildDocx();
-    const fname = (CURRENT.name||'translated').replace(/[^\w\-]+/g,'_')+'.docx';
-    // save to storage + library
-    const path = storagePath(CURRENT.id,'translated','docx');
-    const { error } = await sb.storage.from('ext-papers').upload(path, blob, {upsert:true, contentType:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'});
+    const blob = overlay ? await buildOverlayPdf() : await buildDocx();
+    const ext = overlay ? 'pdf' : 'docx';
+    const ctype = overlay ? 'application/pdf' : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    const fname = (CURRENT.name||'translated').replace(/[^\w\-]+/g,'_')+'.'+ext;
+    const path = storagePath(CURRENT.id,'translated',ext);
+    const { error } = await sb.storage.from('ext-papers').upload(path, blob, {upsert:true, contentType:ctype});
     if(error) throw error;
     await sb.from('ext_papers').update({
       translated_path:path, translated_filename:fname, status:'translated',
       name: $('#reviewName').textContent,
-      extracted: slimDoc(CURRENT._doc, false), translated: slimDoc(CURRENT._doc, true)
+      translated: slimDoc(CURRENT._doc, true)
     }).eq('id',CURRENT.id);
     CURRENT.translated_path=path; CURRENT.translated_filename=fname;
-    // download locally too
     downloadBlob(blob, fname);
     CURRENT._lastBlob = blob;
     setStep('export');
     toast('Saved to library','ok');
   }catch(e){ console.error(e); toast('Export failed: '+(e.message||e),'err'); }
-  finally{ $('#exportBtn').disabled=false; $('#exportBtn').textContent='Export Word document (.docx)'; }
+  finally{ $('#exportBtn').disabled=false; $('#exportBtn').textContent=label; }
 }
-// strip image dataUrls out before saving JSON (keep it small); keep text + tr
+// compact snapshot of the reviewed translation for the library row
 function slimDoc(doc, withTr){
-  return { pages: doc.pages.map(p=>({ index:p.index, scanned:p.scanned,
+  if(doc.mode==='pdf-overlay') return { mode:'pdf-overlay', pages: doc.pages.map(p=>({
+    index:p.index, lines: p.lines.map(l=>({ str:l.str, tr: withTr?l.tr:undefined })) })) };
+  return { mode:'reflow', pages: doc.pages.map(p=>({ index:p.index, scanned:p.scanned,
     blocks: p.blocks.filter(b=>b.type==='text').map(b=>({ kind:b.kind, runs:b.runs, tr: withTr?b.tr:undefined })) })) };
 }
 function downloadBlob(blob, name){
@@ -778,7 +858,7 @@ function wire(){
   ['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('hot');}));
   dz.addEventListener('drop',e=>handleFiles(e.dataTransfer.files));
   // review
-  $('#exportBtn').onclick=exportDocx;
+  $('#exportBtn').onclick=exportTranslated;
   $('#backToLibBtn').onclick=async ()=>{
     // persist current translation state without exporting
     if(CURRENT){ await sb.from('ext_papers').update({name:$('#reviewName').textContent, extracted:slimDoc(CURRENT._doc,false), translated:slimDoc(CURRENT._doc,true)}).eq('id',CURRENT.id); }
@@ -797,6 +877,8 @@ function wire(){
 /* ---------------- test hook (no-login engine testing) ---------------- */
 window.EPT = { extractDocument, translateBlock, mtTranslate, isKeep, buildTextBlocks, runsToText,
   buildDocxFor: async (doc)=>{ CURRENT={_doc:doc, name:'test', id:'test'}; return await buildDocx(); },
+  buildOverlayFor: async (doc)=>{ CURRENT={_doc:doc, name:'test', id:'test'}; return await buildOverlayPdf(); },
+  sanitizePdfText,
   setGlossary:(g)=>{ GLOSSARY=g; } };
 
 /* ---------------- boot ---------------- */
