@@ -10,7 +10,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc =
 
 const SUBJECTS = ['Physics','Chemistry','Geography','Mathematics','Life Sciences'];
 const GRADES   = ['8','9','10','11','12'];
-const TYPES    = ['Term Test','Prelim','Final Exam','Homework','Other'];
+const TYPES    = ['Term Test','Exam','Prelim','Final Exam','Homework','Other'];
 const PERIODS  = ['March','June','September','November'];
 
 let GLOSSARY = [];          // {en, af, subject, source, owner, id}
@@ -185,51 +185,57 @@ async function deleteTerm(g){
   await loadGlossary(); renderGlossary(); toast('Deleted','ok');
 }
 
-/* ---------------- translation engine (free) ---------------- */
+/* ---------------- translation engine (free, no daily limit) ---------------- */
 const TCACHE = new Map();
+// text that must NOT be translated (kept exactly as in the original)
 function isKeep(text){
   const t = text.trim(); if(!t) return true;
+  // multiple-choice / list labels: A  B.  (C)  D)  (i)  1.  a)  — keep exactly
+  if(/^[\(\[]?[A-Za-z0-9]{1,3}[\)\].:]?$/.test(t)) return true;
   const words = (t.match(/[A-Za-zÀ-ÿ]{2,}/g)||[]);
-  if(words.length===0) return true;                 // pure numbers/symbols
+  if(words.length===0) return true;                 // pure numbers/symbols/formulas
   const mathy = /[=×÷±∆Δ→←↔≈≤≥∑√°∫∞]/.test(t);
   if(words.length<=1 && (mathy || /\d/.test(t))) return true;
   return false;
 }
+// primary engine: Google's free endpoint (no key, no daily limit). Falls back to MyMemory.
+async function mtGoogle(text, sl, tl){
+  const u = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${tl}&dt=t&q=${encodeURIComponent(text)}`;
+  const r = await fetch(u); if(!r.ok) throw new Error('google '+r.status);
+  const j = await r.json();
+  if(!Array.isArray(j) || !j[0]) throw new Error('google shape');
+  const out = j[0].map(s=> s && s[0]).filter(x=>x!=null).join('');
+  if(!out.trim()) throw new Error('google empty');
+  return out;
+}
+async function mtMyMemory(text, sl, tl){
+  const u = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${sl}|${tl}`;
+  const r = await fetch(u); const j = await r.json();
+  const tt = j && j.responseData && j.responseData.translatedText;
+  if(!tt || /MYMEMORY WARNING|QUOTA|LIMIT/i.test(tt)) throw new Error('mymemory');
+  return tt;
+}
 async function mtTranslate(text, dir){
-  const pair = dir==='en_af' ? 'en|af' : 'af|en';
-  const key = pair+'::'+text;
+  const [sl,tl] = dir==='en_af' ? ['en','af'] : ['af','en'];
+  const key = sl+tl+'::'+text;
   if(TCACHE.has(key)) return TCACHE.get(key);
-  // MyMemory caps ~500 chars/request; split on sentence boundaries.
-  const chunks = text.match(/[^.!?]+[.!?]?/g) || [text];
-  let out = '';
-  for(const c of chunks){
-    const q = c.trim(); if(!q){ out+=c; continue; }
-    try{
-      const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(q)}&langpair=${pair}`;
-      const r = await fetch(url);
-      const j = await r.json();
-      if(j.responseStatus===200 || j.responseData){
-        let tt = j.responseData.translatedText || q;
-        if(/MYMEMORY WARNING|QUOTA|LIMIT/i.test(tt)) throw new Error('limit');
-        out += (c.startsWith(' ')?' ':'') + tt + (c.endsWith(' ')?' ':'');
-      }else throw new Error('mt');
-    }catch(e){
-      if(e.message==='limit'){ TCACHE.set(key, {text, limit:true}); return {text, limit:true}; }
-      out += c; // on failure keep source
-    }
+  let res;
+  try{ res = { text: await mtGoogle(text, sl, tl) }; }
+  catch(e){
+    try{ res = { text: await mtMyMemory(text, sl, tl) }; }
+    catch(e2){ res = { text, failed:true }; }        // couldn't translate — keep source, flag it
   }
-  const res = {text: out.trim()};
   TCACHE.set(key, res);
   return res;
 }
-// translate one natural-language block -> {mode, text, hints, limit}
+// translate one natural-language unit -> {mode, text, hints, failed}
 async function translateBlock(srcText, dir){
   const trimmed = srcText.trim();
   if(isKeep(trimmed)) return {mode:'keep', text:srcText};
   const exact = glossaryExact(trimmed, dir);
   if(exact!==null) return {mode:'gloss', text:exact};
   const r = await mtTranslate(trimmed, dir);
-  return {mode:'mt', text:r.text, hints:glossaryHints(trimmed,dir), limit:!!r.limit};
+  return {mode:'mt', text:r.text, hints:glossaryHints(trimmed,dir), failed:!!r.failed};
 }
 
 /* ---------------- PDF / image extraction ---------------- */
@@ -379,11 +385,16 @@ async function extractDocx(file, onNote){
 // ---- PDF: line geometry so we can overlay translated text in place (keeps original page exactly) ----
 // pdf.js text item.transform[4],[5] are already in PDF user space (bottom-left origin),
 // which matches pdf-lib's coordinate system directly — no flip needed.
-function groupLines(items){
+function fontIsSerif(fam){
+  if(!fam) return false; fam = fam.toLowerCase();
+  if(fam.includes('sans')) return false;
+  return /serif|times|georgia|roman|garamond|minion|book antiqua|cambria/.test(fam);
+}
+function groupLines(items, styles){
   const arr = items.map(it=>({
     x: it.transform[4], y: it.transform[5],
     size: Math.hypot(it.transform[2], it.transform[3]) || it.height || 10,
-    w: it.width || 0, str: it.str
+    w: it.width || 0, str: it.str, fn: it.fontName
   })).filter(a=>a.str && a.str.length);
   const lines=[];
   arr.forEach(a=>{
@@ -396,7 +407,9 @@ function groupLines(items){
     const x = Math.min(...l.items.map(i=>i.x));
     const right = Math.max(...l.items.map(i=>i.x + i.w));
     const ys = l.items.map(i=>i.y).sort((a,b)=>a-b);
-    return { x, y: ys[Math.floor(ys.length/2)], size:l.size, width: Math.max(right-x, 4), str: l.items.map(i=>i.str).join('') };
+    const fam = styles && l.items[0] && styles[l.items[0].fn] && styles[l.items[0].fn].fontFamily;
+    return { x, y: ys[Math.floor(ys.length/2)], size:l.size, width: Math.max(right-x, 4),
+             str: l.items.map(i=>i.str).join(''), serif: fontIsSerif(fam) };
   }).filter(l=>l.str.trim()).sort((a,b)=> b.y - a.y);
 }
 async function extractPdfOverlay(file, onNote, onProgress){
@@ -410,7 +423,7 @@ async function extractPdfOverlay(file, onNote, onProgress){
     const tc = await page.getTextContent();
     const items = tc.items.filter(i=>i.str && i.str.length);
     if(items.length>3) digitalPages++;
-    pages.push({ index:p, width:vp.width, height:vp.height, lines: groupLines(items) });
+    pages.push({ index:p, width:vp.width, height:vp.height, lines: groupLines(items, tc.styles) });
     onProgress && onProgress(p/pdf.numPages*0.5);
   }
   return { mode:'pdf-overlay', bytes, pages, digital: digitalPages>0 };
@@ -431,11 +444,84 @@ async function extractPdfReflowOcr(file, onNote, onProgress){
   return {mode:'reflow', pages};
 }
 
+// ---- Word (.docx) IN-PLACE: only swap text inside runs, keep ALL formatting exactly ----
+const WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+const XMLNS = 'http://www.w3.org/XML/1998/namespace';
+function wEls(node, tag){ return [...node.getElementsByTagNameNS(WNS, tag)]; }
+function runVertAlign(r){
+  const rPr = wEls(r,'rPr')[0]; if(!rPr) return null;
+  const va = [...rPr.childNodes].find(n=>n.localName==='vertAlign');
+  return va ? (va.getAttributeNS(WNS,'val') || va.getAttribute('w:val')) : null;
+}
+function runRprSig(r){ const rPr = wEls(r,'rPr')[0]; return rPr ? new XMLSerializer().serializeToString(rPr) : ''; }
+// coalesce adjacent same-format, non-sub/superscript runs into translatable segments
+function collectSegments(dom){
+  const segs=[];
+  wEls(dom.documentElement,'p').forEach(p=>{
+    const runs = wEls(p,'r');
+    let cur=null, curSig=null;
+    const flush=()=>{ if(cur && cur.src.trim() && !isKeep(cur.src)) segs.push(cur); cur=null; curSig=null; };
+    runs.forEach(r=>{
+      const tEls = wEls(r,'t');
+      const text = tEls.map(t=>t.textContent).join('');
+      const va = runVertAlign(r);
+      const translatable = tEls.length>0 && text.trim().length>0 && va!=='subscript' && va!=='superscript';
+      if(!translatable){ flush(); return; }              // sub/superscript & formulas kept exactly
+      const sig = runRprSig(r);
+      if(cur && sig===curSig){ cur.src += text; cur.tEls.push(...tEls); }
+      else { flush(); cur = {src:text, tEls:tEls.slice()}; curSig=sig; }
+    });
+    flush();
+  });
+  segs.forEach(s=>{ s.lead=(s.src.match(/^\s*/)||[''])[0]; s.trail=(s.src.match(/\s*$/)||[''])[0]; });
+  return segs;
+}
+async function extractDocxInplace(file, onNote, onProgress){
+  onNote && onNote('Reading Word document…');
+  if(!window.JSZip) throw new Error('Zip reader not loaded — please refresh.');
+  const zip = await JSZip.loadAsync(file);
+  const names = Object.keys(zip.files).filter(n=>/^word\/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$/.test(n));
+  const parts=[];
+  for(const name of names){
+    const xml = await zip.file(name).async('string');
+    const dom = new DOMParser().parseFromString(xml, 'application/xml');
+    if(dom.getElementsByTagName('parsererror').length) continue;
+    parts.push({ name, dom, segments: collectSegments(dom) });
+  }
+  if(!parts.length) throw new Error('This Word file could not be read — try re-saving it as .docx.');
+  onProgress && onProgress(0.5);
+  return { mode:'docx-inplace', zip, parts };
+}
+async function buildDocxInplace(){
+  const { zip, parts } = CURRENT._doc;
+  for(const part of parts){
+    part.segments.forEach(seg=>{
+      const tr = seg.tr; if(!tr) return;
+      if(tr.mode==='keep' && !tr.edited) return;
+      const core = (tr.text!=null ? tr.text : seg.src).replace(/^\s+|\s+$/g,'');
+      seg.tEls[0].textContent = seg.lead + core + seg.trail;
+      seg.tEls[0].setAttributeNS(XMLNS, 'xml:space', 'preserve');
+      for(let i=1;i<seg.tEls.length;i++) seg.tEls[i].textContent='';
+    });
+    const xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + new XMLSerializer().serializeToString(part.dom);
+    zip.file(part.name, xml);
+  }
+  return await zip.generateAsync({ type:'blob', mimeType:'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+}
+// flat list of translation units (each has .src and receives .tr) across any doc mode
+function collectUnits(doc){
+  const u=[];
+  if(doc.mode==='pdf-overlay') doc.pages.forEach(p=>p.lines.forEach(l=>{ l.src=l.str; u.push(l); }));
+  else if(doc.mode==='docx-inplace') doc.parts.forEach(p=>p.segments.forEach(s=>u.push(s)));
+  else doc.pages.forEach(p=>p.blocks.forEach(b=>{ if(b.type==='text'){ b.src=runsToText(b.runs); u.push(b); } }));
+  return u;
+}
+
 async function extractDocument(file, onNote, onProgress){
   const isPdf  = file.type==='application/pdf' || /\.pdf$/i.test(file.name);
   const isDocx = /\.docx$/i.test(file.name) || file.type==='application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   if(/\.doc$/i.test(file.name) && !isDocx) throw new Error('Old .doc files aren’t supported — please save it as .docx or PDF first.');
-  if(isDocx){ const d = await extractDocx(file, onNote); onProgress && onProgress(0.5); return d; }
+  if(isDocx){ return await extractDocxInplace(file, onNote, onProgress); }   // keep formatting exactly
   if(isPdf){
     const ov = await extractPdfOverlay(file, onNote, onProgress);
     if(ov.digital) return ov;                                    // digital PDF → faithful in-place overlay
@@ -519,19 +605,16 @@ async function handleFiles(files){
 
     // 4) translate (unit = a PDF line for overlay, or a text block for reflow)
     procNote('Translating…');
-    const overlay = doc.mode==='pdf-overlay';
-    const units=[];
-    doc.pages.forEach(pg=> (overlay ? pg.lines : pg.blocks.filter(b=>b.type==='text')).forEach(u=>units.push(u)));
-    let total=units.length, done=0, hitLimit=false;
+    const units = collectUnits(doc);
+    let total=units.length, done=0, failed=0;
     for(const u of units){
-      const src = overlay ? u.str : runsToText(u.runs);
-      u.tr = await translateBlock(src, row.direction);
-      if(u.tr.limit) hitLimit=true;
+      u.tr = await translateBlock(u.src, row.direction);
+      if(u.tr.failed) failed++;
       done++; setBar(0.5 + (done/Math.max(1,total))*0.5);
       procNote(`Translating… (${done}/${total})`);
     }
     procDone('Translation ready for review');
-    if(hitLimit) toast('The free translation service hit its daily limit on some text — those blocks are left in the original language for you to edit.','err');
+    if(failed) toast(`${failed} line(s) couldn't be translated automatically — left in the original for you to edit.`,'err');
     renderReview();
     setStep('review');
   }catch(e){
@@ -550,6 +633,11 @@ function readFormTags(file){
   };
 }
 function pageText(doc, i){
+  if(doc.mode==='docx-inplace'){
+    if(i>0) return '';
+    const dp = doc.parts.find(p=>/document/.test(p.name)) || doc.parts[0];
+    return dp ? dp.segments.map(s=>s.src).join(' ') : '';
+  }
   const pg = doc.pages[i]; if(!pg) return '';
   if(doc.mode==='pdf-overlay') return (pg.lines||[]).map(l=>l.str).join(' ');
   return (pg.blocks||[]).filter(b=>b.type==='text').map(b=>runsToText(b.runs)).join(' ');
@@ -584,42 +672,52 @@ function autoDetectTags(doc){
 }
 
 /* ---------------- review ---------------- */
+function reviewItems(doc){
+  const items=[];
+  if(doc.mode==='pdf-overlay'){
+    doc.pages.forEach(pg=>{ items.push({header:`Page ${pg.index}`}); pg.lines.forEach(l=>{ l.src=l.str; items.push({origHtml:esc(l.str), unit:l}); }); });
+  }else if(doc.mode==='docx-inplace'){
+    doc.parts.forEach(part=>{
+      const label = /document/.test(part.name)?'Document body' : /header/.test(part.name)?'Header' : /footer/.test(part.name)?'Footer' : /footnote/.test(part.name)?'Footnotes':part.name;
+      items.push({header:label});
+      part.segments.forEach(s=>items.push({origHtml:esc(s.src), unit:s}));
+    });
+  }else{
+    doc.pages.forEach(pg=>{ items.push({header:`Page ${pg.index}${pg.scanned?' · scanned (OCR)':''}`});
+      pg.blocks.forEach(b=>{ if(b.type==='image') items.push({isImage:true, dataUrl:b.dataUrl});
+        else { b.src=runsToText(b.runs); items.push({origHtml:runsToHtml(b.runs), unit:b}); } }); });
+  }
+  return items;
+}
 function renderReview(){
   const doc = CURRENT._doc;
-  const overlay = doc.mode==='pdf-overlay';
   $('#reviewName').textContent = CURRENT.name || CURRENT.original_filename;
-  $('#exportBtn').textContent = overlay ? 'Export translated PDF' : 'Export Word document (.docx)';
+  $('#exportBtn').textContent = doc.mode==='pdf-overlay' ? 'Export translated PDF' : 'Export translated Word document (.docx)';
   const host = $('#reviewPages'); host.innerHTML='';
-  doc.pages.forEach(pg=>{
-    const card = el('div','card pagecard');
-    card.appendChild(el('div','phead', `Page ${pg.index}${pg.scanned?' · scanned (OCR)':''}`));
-    const sbs = el('div','sbs');
-    const orig = el('div','col orig'); orig.appendChild(el('h4',null,'Original'));
-    const trc  = el('div','col'); trc.appendChild(el('h4',null,'Translated'));
-    const units = overlay ? pg.lines : pg.blocks;
-    units.forEach(u=>{
-      if(!overlay && u.type==='image'){
-        const o=el('div','blk imgblk'); o.innerHTML=`<img class="diagram" src="${u.dataUrl}">`; orig.appendChild(o);
-        const t=el('div','blk imgblk'); t.innerHTML=`<img class="diagram" src="${u.dataUrl}"><div class="muted" style="font-size:11px;margin-top:4px">Diagram — kept as-is</div>`; trc.appendChild(t);
-        return;
-      }
-      const srcText = overlay ? u.str : runsToText(u.runs);
-      const ob = el('div','blk orig-blk'); ob.innerHTML = overlay ? esc(u.str) : runsToHtml(u.runs); orig.appendChild(ob);
-      const tr = u.tr || (u.tr = {mode:'keep', text:srcText});
-      const mode = tr.mode;
-      const tb = el('div','blk tr '+mode);
-      tb.appendChild(el('span','htag', mode==='gloss'?'Glossary':mode==='mt'?'Machine — check':'Kept as-is'));
-      const body = el('div'); body.contentEditable='true'; body.spellcheck=false;
-      body.textContent = tr.text!=null ? tr.text : srcText;
-      body.style.minHeight='1.2em';
-      body.addEventListener('input', ()=>{ tr.text = body.textContent; tr.edited=true; });
-      tb.appendChild(body);
-      if(mode==='mt' && tr.hints && tr.hints.length){
-        tb.appendChild(el('div','hints','Glossary suggests: '+tr.hints.map(esc).join(' · ')));
-      }
-      trc.appendChild(tb);
-    });
-    sbs.append(orig, trc); card.appendChild(sbs); host.appendChild(card);
+  let orig=null, trc=null;
+  const newCard=(title)=>{
+    const card=el('div','card pagecard'); card.appendChild(el('div','phead', esc(title)));
+    const sbs=el('div','sbs'); orig=el('div','col orig'); orig.appendChild(el('h4',null,'Original'));
+    trc=el('div','col'); trc.appendChild(el('h4',null,'Translated')); sbs.append(orig,trc); card.appendChild(sbs); host.appendChild(card);
+  };
+  reviewItems(doc).forEach(it=>{
+    if(it.header){ newCard(it.header); return; }
+    if(!orig) newCard('Content');
+    if(it.isImage){
+      const o=el('div','blk imgblk'); o.innerHTML=`<img class="diagram" src="${it.dataUrl}">`; orig.appendChild(o);
+      const t=el('div','blk imgblk'); t.innerHTML=`<img class="diagram" src="${it.dataUrl}"><div class="muted" style="font-size:11px;margin-top:4px">Diagram — kept as-is</div>`; trc.appendChild(t);
+      return;
+    }
+    const ob=el('div','blk orig-blk'); ob.innerHTML=it.origHtml; orig.appendChild(ob);
+    const unit=it.unit; const tr = unit.tr || (unit.tr={mode:'keep', text:unit.src});
+    const tb=el('div','blk tr '+tr.mode);
+    tb.appendChild(el('span','htag', tr.mode==='gloss'?'Glossary':tr.mode==='mt'?'Machine — check':'Kept as-is'));
+    const body=el('div'); body.contentEditable='true'; body.spellcheck=false;
+    body.textContent = tr.text!=null ? tr.text : unit.src; body.style.minHeight='1.2em';
+    body.addEventListener('input', ()=>{ tr.text=body.textContent; tr.edited=true; });
+    tb.appendChild(body);
+    if(tr.mode==='mt' && tr.hints && tr.hints.length) tb.appendChild(el('div','hints','Glossary suggests: '+tr.hints.map(esc).join(' · ')));
+    trc.appendChild(tb);
   });
 }
 
@@ -674,7 +772,8 @@ function sanitizePdfText(s){
 async function buildOverlayPdf(){
   const { PDFDocument, StandardFonts, rgb } = PDFLib;
   const pdf = await PDFDocument.load(CURRENT._doc.bytes);
-  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const sans  = await pdf.embedFont(StandardFonts.Helvetica);   // matches Arial/Helvetica papers
+  const serif = await pdf.embedFont(StandardFonts.TimesRoman);  // matches Times/serif papers
   const pages = pdf.getPages();
   CURRENT._doc.pages.forEach(pg=>{
     const page = pages[pg.index-1]; if(!page) return;
@@ -682,9 +781,9 @@ async function buildOverlayPdf(){
       const tr = ln.tr; if(!tr) return;
       if(tr.mode==='keep' && !tr.edited) return;               // leave numbers/formulas untouched
       const text = sanitizePdfText(tr.text||''); if(!text.trim()) return;
-      // cover the original line with a white box
+      const font = ln.serif ? serif : sans;
+      // cover the original line with a white box, then redraw the translation in the same slot
       page.drawRectangle({ x: ln.x-1, y: ln.y - ln.size*0.28, width: ln.width+2, height: ln.size*1.34, color: rgb(1,1,1) });
-      // fit translated text into the original line width
       let size = ln.size || 10;
       const maxW = Math.max(ln.width, 6);
       const w = font.widthOfTextAtSize(text, size);
@@ -697,11 +796,12 @@ async function buildOverlayPdf(){
 }
 
 async function exportTranslated(){
-  const overlay = CURRENT._doc.mode==='pdf-overlay';
-  const label = overlay ? 'Export translated PDF' : 'Export Word document (.docx)';
+  const mode = CURRENT._doc.mode;
+  const overlay = mode==='pdf-overlay';
+  const label = overlay ? 'Export translated PDF' : 'Export translated Word document (.docx)';
   $('#exportBtn').disabled=true; $('#exportBtn').textContent='Building…';
   try{
-    const blob = overlay ? await buildOverlayPdf() : await buildDocx();
+    const blob = overlay ? await buildOverlayPdf() : mode==='docx-inplace' ? await buildDocxInplace() : await buildDocx();
     const ext = overlay ? 'pdf' : 'docx';
     const ctype = overlay ? 'application/pdf' : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
     const fname = (CURRENT.name||'translated').replace(/[^\w\-]+/g,'_')+'.'+ext;
@@ -725,6 +825,8 @@ async function exportTranslated(){
 function slimDoc(doc, withTr){
   if(doc.mode==='pdf-overlay') return { mode:'pdf-overlay', pages: doc.pages.map(p=>({
     index:p.index, lines: p.lines.map(l=>({ str:l.str, tr: withTr?l.tr:undefined })) })) };
+  if(doc.mode==='docx-inplace') return { mode:'docx-inplace', parts: doc.parts.map(p=>({
+    name:p.name, segments: p.segments.map(s=>({ src:s.src, tr: withTr?({mode:s.tr&&s.tr.mode, text:s.tr&&s.tr.text}):undefined })) })) };
   return { mode:'reflow', pages: doc.pages.map(p=>({ index:p.index, scanned:p.scanned,
     blocks: p.blocks.filter(b=>b.type==='text').map(b=>({ kind:b.kind, runs:b.runs, tr: withTr?b.tr:undefined })) })) };
 }
@@ -878,7 +980,8 @@ function wire(){
 window.EPT = { extractDocument, translateBlock, mtTranslate, isKeep, buildTextBlocks, runsToText,
   buildDocxFor: async (doc)=>{ CURRENT={_doc:doc, name:'test', id:'test'}; return await buildDocx(); },
   buildOverlayFor: async (doc)=>{ CURRENT={_doc:doc, name:'test', id:'test'}; return await buildOverlayPdf(); },
-  sanitizePdfText,
+  buildInplaceFor: async (doc)=>{ CURRENT={_doc:doc, name:'test', id:'test'}; return await buildDocxInplace(); },
+  collectUnits, sanitizePdfText,
   setGlossary:(g)=>{ GLOSSARY=g; } };
 
 /* ---------------- boot ---------------- */
