@@ -78,10 +78,9 @@ async function onSession(session){
     $('#topbar').classList.remove('hidden');
     $('#app').classList.remove('hidden');
     $('#whoEmail').textContent = session.user.email;
-    await loadGlossary();
-    initFormSelects();
-    await loadLibrary();
-    nav('library');
+    initFormSelects();      // synchronous — fill dropdowns first, before any network call
+    nav('library');         // show + load the library
+    await loadGlossary();   // glossary for translation (safe now: runs outside the auth lock)
   }else{
     SESSION_USER = null;
     $('#screen-auth').classList.remove('hidden');
@@ -804,6 +803,7 @@ window.EPT = { extractDocument, translateBlock, mtTranslate, isKeep, buildTextBl
 if(!window.EPT_TEST){
   wire();
   sb.auth.getSession().then(({data})=>onSession(data.session));
-  sb.auth.onAuthStateChange((_e, session)=>onSession(session));
+  // defer outside the auth-change lock — calling supabase inside the callback deadlocks
+  sb.auth.onAuthStateChange((_e, session)=>{ setTimeout(()=>onSession(session), 0); });
   if('serviceWorker' in navigator){ window.addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{})); }
 }
