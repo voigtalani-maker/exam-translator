@@ -402,15 +402,32 @@ function groupLines(items, styles){
     if(!ln){ ln={baseY:a.y, size:a.size, items:[]}; lines.push(ln); }
     ln.items.push(a); ln.size=Math.max(ln.size, a.size);
   });
-  return lines.map(l=>{
+  // split each visual line into segments at big horizontal gaps (separate table
+  // cells / tab stops), so each cell is translated and redrawn inside ITS OWN
+  // space — the white cover never crosses a cell border.
+  const units=[];
+  lines.forEach(l=>{
     l.items.sort((p,q)=>p.x-q.x);
-    const x = Math.min(...l.items.map(i=>i.x));
-    const right = Math.max(...l.items.map(i=>i.x + i.w));
-    const ys = l.items.map(i=>i.y).sort((a,b)=>a-b);
-    const fam = styles && l.items[0] && styles[l.items[0].fn] && styles[l.items[0].fn].fontFamily;
-    return { x, y: ys[Math.floor(ys.length/2)], size:l.size, width: Math.max(right-x, 4),
-             str: l.items.map(i=>i.str).join(''), serif: fontIsSerif(fam) };
-  }).filter(l=>l.str.trim()).sort((a,b)=> b.y - a.y);
+    const gapAt = Math.max(8, l.size*1.5);
+    let seg=null, pendingWs=[];
+    const flush=()=>{ if(seg) units.push(seg); seg=null; pendingWs=[]; };
+    l.items.forEach(it=>{
+      if(!it.str.trim()){ if(seg) pendingWs.push(it); return; }   // whitespace never bridges a gap
+      if(seg && it.x - seg.right > gapAt) flush();
+      if(!seg){ seg={items:[], right:-Infinity, size:l.size}; pendingWs=[]; }
+      else if(pendingWs.length){ seg.items.push(...pendingWs); pendingWs=[]; }
+      seg.items.push(it); seg.right=Math.max(seg.right, it.x + it.w);
+    });
+    flush();
+  });
+  return units.map(s=>{
+    const x = Math.min(...s.items.map(i=>i.x));
+    const right = Math.max(...s.items.map(i=>i.x + i.w));
+    const ys = s.items.map(i=>i.y).sort((a,b)=>a-b);
+    const fam = styles && s.items[0] && styles[s.items[0].fn] && styles[s.items[0].fn].fontFamily;
+    return { x, y: ys[Math.floor(ys.length/2)], size:s.size, width: Math.max(right-x, 4),
+             str: s.items.map(i=>i.str).join(''), serif: fontIsSerif(fam) };
+  }).filter(l=>l.str.trim()).sort((a,b)=> b.y - a.y || a.x - b.x);
 }
 async function extractPdfOverlay(file, onNote, onProgress){
   const bytes = new Uint8Array(await file.arrayBuffer());
@@ -782,8 +799,9 @@ async function buildOverlayPdf(){
       if(tr.mode==='keep' && !tr.edited) return;               // leave numbers/formulas untouched
       const text = sanitizePdfText(tr.text||''); if(!text.trim()) return;
       const font = ln.serif ? serif : sans;
-      // cover the original line with a white box, then redraw the translation in the same slot
-      page.drawRectangle({ x: ln.x-1, y: ln.y - ln.size*0.28, width: ln.width+2, height: ln.size*1.34, color: rgb(1,1,1) });
+      // cover ONLY this segment's text (tight box — never crosses a table border),
+      // then redraw the translation in the same slot
+      page.drawRectangle({ x: ln.x-0.5, y: ln.y - ln.size*0.22, width: ln.width+1, height: ln.size*1.22, color: rgb(1,1,1) });
       let size = ln.size || 10;
       const maxW = Math.max(ln.width, 6);
       const w = font.widthOfTextAtSize(text, size);
