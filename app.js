@@ -247,13 +247,18 @@ async function translateUnit(u, dir){
   if(!u.parts || !u.parts.some(p=>p.special)) return await translateBlock(src, dir);
   const outParts=[]; let anyMt=false, anyGloss=false, failed=false; const hints=[];
   for(const p of u.parts){
-    if(p.special || isKeep(p.t)){ outParts.push({t:p.t, x:p.x, w:p.w, special:p.special, kept:true}); continue; }
+    if(p.special || isKeep(p.t)){
+      outParts.push({t:p.t, x:p.x, w:p.w, script:p.script, special:p.special, kept:true}); continue;
+    }
     const tr = await translateBlock(p.t, dir);
     const unchanged = (tr.text||'').trim() === p.t.trim();   // translation identical -> keep original ink
     if(!unchanged){ if(tr.mode==='mt') anyMt=true; else if(tr.mode==='gloss') anyGloss=true; }
     if(tr.failed) failed=true;
     if(tr.hints) hints.push(...tr.hints);
-    outParts.push({t:tr.text, x:p.x, w:p.w, special:false, kept: tr.mode==='keep' || unchanged});
+    // preserve the original leading/trailing spaces so words don't run together
+    const lead=(p.t.match(/^\s*/)||[''])[0], trail=(p.t.match(/\s*$/)||[''])[0];
+    outParts.push({t: lead + (tr.text||'').trim() + trail, x:p.x, w:p.w,
+                   script:null, special:false, kept: tr.mode==='keep' || unchanged});
   }
   return { mode: anyMt?'mt':(anyGloss?'gloss':'keep'),
            text: outParts.map(p=>p.t).join(''), parts:outParts, hints, failed };
@@ -419,7 +424,10 @@ function groupLines(items, styles){
   })).filter(a=>a.str && a.str.length);
   const lines=[];
   arr.forEach(a=>{
-    let ln = lines.find(l=> Math.abs(l.baseY - a.y) < Math.max(1.5, l.size*0.4));
+    // tolerance must be wide enough to catch a raised superscript (~0.47em)
+    // but stay well under normal line spacing (~1.2em), or exponents break off
+    // into their own "line" and lose their base number.
+    let ln = lines.find(l=> Math.abs(l.baseY - a.y) < Math.max(2, l.size*0.62));
     if(!ln){ ln={baseY:a.y, size:a.size, items:[]}; lines.push(ln); }
     ln.items.push(a); ln.size=Math.max(ln.size, a.size);
   });
@@ -452,27 +460,39 @@ function groupLines(items, styles){
     const mainSize = Math.max(...(baseItems.length?baseItems:s.items).map(i=>i.size));
     // split into parts: normal text vs super/subscript (smaller and/or offset
     // from the baseline). Special parts keep their ORIGINAL ink — never redrawn.
-    const flag = it => (it.size < mainSize*0.82) || (Math.abs(it.y - baseY) > mainSize*0.12);
+    // classify each item: superscript / subscript / normal
+    const scriptOf = it => {
+      const small = it.size < mainSize*0.82;
+      const dy = it.y - baseY;
+      if(dy >  mainSize*0.12 && (small || dy > mainSize*0.2)) return 'super';
+      if(dy < -mainSize*0.10 && (small || dy < -mainSize*0.2)) return 'sub';
+      return small ? 'sub' : null;      // smaller-but-on-baseline usually a subscript
+    };
     // right-to-left cascade: short formula tokens (PCℓ, C, F, CO…) directly
-    // before a sub/superscript belong to the formula — keep their original ink
+    // before a sub/superscript belong to that formula — never translate them
     const isTok = t => t.trim().length<=8 && /^[\(\[]?\d*[A-ZΔ][A-Za-zℓ]{0,5}[\)\]]?$/.test(t.trim());
-    const eff = new Array(s.items.length);
-    let nextEff = false;
+    const scr = s.items.map(scriptOf);
+    const formula = new Array(s.items.length).fill(false);
+    let nextSpecial = false;
     for(let i=s.items.length-1;i>=0;i--){
       const it=s.items[i];
-      if(!it.str.trim()){ eff[i]=false; continue; }         // whitespace: transparent to the cascade
-      eff[i] = flag(it) || (nextEff && isTok(it.str));
-      nextEff = eff[i];
+      if(!it.str.trim()) continue;                          // whitespace: transparent
+      formula[i] = !scr[i] && nextSpecial && isTok(it.str);
+      nextSpecial = !!scr[i] || formula[i];
     }
     const parts=[]; let cur=null;
     s.items.forEach((it,idx)=>{
-      const special = !!eff[idx] && !!it.str.trim() ? eff[idx] : (it.str.trim() ? false : (cur?cur.special:false));
-      if(cur && cur.special===special){ cur.t+=it.str; cur.right=Math.max(cur.right, it.x+it.w); }
-      else { cur={t:it.str, x:it.x, right:it.x+it.w, special}; parts.push(cur); }
+      const blank = !it.str.trim();
+      const script = blank ? (cur?cur.script:null) : scr[idx];
+      const keep   = blank ? (cur?cur.keep:false) : (!!scr[idx] || formula[idx]);
+      if(cur && cur.script===script && cur.keep===keep){ cur.t+=it.str; cur.right=Math.max(cur.right, it.x+it.w); }
+      else { cur={t:it.str, x:it.x, right:it.x+it.w, script, keep, special: !!script||keep}; parts.push(cur); }
     });
     parts.forEach(p=>{ p.w=Math.max(p.right-p.x,2); delete p.right; });
+    const ysAll = s.items.map(i=>i.y);
     const fam = styles && s.items[0] && styles[s.items[0].fn] && styles[s.items[0].fn].fontFamily;
     return { x, y: baseY, size:mainSize, width: Math.max(right-x, 4),
+             yMin: Math.min(...ysAll), yMax: Math.max(...ysAll),
              str: parts.map(p=>p.t).join(''), parts, serif: fontIsSerif(fam) };
   }).filter(l=>l.str.trim()).sort((a,b)=> b.y - a.y || a.x - b.x);
 }
@@ -868,8 +888,12 @@ async function buildOverlayPdf(){
       const tr = ln.tr; if(!tr) return;
       if(tr.mode==='keep' && !tr.edited) return;               // leave numbers/formulas untouched
       if(!tr.edited && (tr.text||'').trim()===ln.str.trim()) return; // translation identical -> original ink stays
-      const font = ln.serif ? serif : sans;
-      const stdFont = ln.serif ? stdSerif : stdSans;
+      const font = ln.serif ? serif : sans;          // full-Unicode fallback
+      const stdFont = ln.serif ? stdSerif : stdSans; // matches original metrics best
+      // Prefer the standard font (its widths match the original paper); only
+      // fall back to the wider Unicode font for text it cannot encode (ℓ, ⇌…),
+      // otherwise everything shrinks unnecessarily.
+      const pickFont = t => { try{ stdFont.widthOfTextAtSize(t, 10); return stdFont; }catch(e){ return font; } };
       const drawSlot = (text, x, w0, baseSize)=>{            // cover one slot, redraw text inside it
         const t = clean(text); if(!t.trim()) return;
         page.drawRectangle({ x: x-0.5, y: ln.y - baseSize*0.22, width: w0+1, height: baseSize*1.22, color: rgb(1,1,1) });
@@ -880,13 +904,37 @@ async function buildOverlayPdf(){
           if(w > maxW) size = Math.max(4, size * maxW / w);
           page.drawText(tt, { x, y: ln.y, size, font:f, color: rgb(0,0,0) });
         };
-        try{ tryDraw(font, t); }
+        try{ tryDraw(pickFont(t), t); }
         catch(e){ try{ tryDraw(stdFont, sanitizePdfText(text)); }catch(e2){} }
       };
       if(tr.parts && !tr.edited){
-        // per-part: translated words replaced in their own slot; kept/special
-        // parts (formulas, sub/superscripts, °C, ΔH…) keep their ORIGINAL ink
-        tr.parts.forEach(p=>{ if(p.kept || p.special) return; drawSlot(p.t, p.x, p.w, ln.size); });
+        // Line mixes words with formulas/scripts: cover it and REFLOW the whole
+        // line so nothing gaps when the translation has a different length.
+        // Sub/superscripts are redrawn as real scripts (smaller + offset), so
+        // C₂H₆ and 10² come out correctly.
+        const S = ln.size || 10;
+        const rightEdge = Math.max(ln.x + ln.width, ...tr.parts.map(p=>p.x + p.w));
+        const yTop = Math.max(ln.y + S*0.86, (ln.yMax!=null?ln.yMax:ln.y) + S*0.55);
+        const yBot = Math.min(ln.y - S*0.26, (ln.yMin!=null?ln.yMin:ln.y) - S*0.28);
+        page.drawRectangle({ x: ln.x-0.5, y: yBot, width: (rightEdge-ln.x)+1, height: yTop-yBot, color: rgb(1,1,1) });
+        const seq = tr.parts.map(p=>{
+          const t = clean(p.t);
+          const f = pickFont(t);
+          const size = p.script ? S*0.66 : S;
+          let w; try{ w = f.widthOfTextAtSize(t, size); }catch(e){ w = t.length*size*0.5; }
+          return { t, size, w, f, script:p.script };
+        }).filter(i=>i.t.length);
+        const total = seq.reduce((a,i)=>a+i.w, 0);
+        const maxW = Math.max(rightEdge - ln.x, 6);
+        const k = total > maxW ? maxW/total : 1;
+        let cx = ln.x;
+        seq.forEach(i=>{
+          const size = i.size*k;
+          const dy = i.script==='super' ? S*k*0.34 : i.script==='sub' ? -S*k*0.14 : 0;
+          try{ page.drawText(i.t, { x:cx, y: ln.y+dy, size, font:i.f, color: rgb(0,0,0) }); }
+          catch(e){ try{ page.drawText(sanitizePdfText(i.t), { x:cx, y: ln.y+dy, size, font:stdFont, color: rgb(0,0,0) }); }catch(e2){} }
+          cx += i.w*k;
+        });
       }else{
         drawSlot(tr.text||'', ln.x, ln.width, ln.size);      // edited by hand → whole-line replace
       }
