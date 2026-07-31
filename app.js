@@ -190,14 +190,21 @@ const TCACHE = new Map();
 // text that must NOT be translated (kept exactly as in the original)
 function isKeep(text){
   const t = text.trim(); if(!t) return true;
-  // multiple-choice / list labels: A  B.  (C)  D)  (i)  1.  a)  — keep exactly
-  if(/^[\(\[]?[A-Za-z0-9]{1,3}[\)\].:]?$/.test(t)) return true;
-  // chemistry state symbols (s) (g) (aq) (ℓ) — it's an equation chunk, keep exactly
-  if(/\((s|g|aq|ℓ|l)\)/.test(t)) return true;
+  // multiple-choice / list labels only: A  b.  (C)  D)  1.  (iii)  — keep exactly.
+  // Must NOT catch real words like "the"/"of", or they'd never get translated.
+  if(/^[\(\[]?[A-Za-z][\)\].:]?$/.test(t)) return true;                        // single letter
+  if(/^[\(\[]?\d{1,3}[\)\].:]?$/.test(t)) return true;                         // number label
+  if(/^[\(\[]?(i{1,3}|iv|vi{0,3}|ix|xi{0,3})[\)\].:]?$/i.test(t)) return true; // roman numeral
   const words = (t.match(/[A-Za-zÀ-ÿ]{2,}/g)||[]);
   if(words.length===0) return true;                 // pure numbers/symbols/formulas
   const mathy = /[=+×÷±∆Δ→←↔⇌≈≤≥∑√°∫∞·]/.test(t);
   if(words.length<=1 && (mathy || /\d/.test(t))) return true;
+  // A chemical equation (state symbols and NO prose) is kept exactly — but a
+  // question sentence that merely mentions CO2(g) must still be translated.
+  if(/\([sgaqℓl]\)/.test(t)){
+    const prose = (t.replace(/\([sgaqℓl]\)/g,' ').match(/\b[a-zà-ÿ]{3,}\b/g)||[]);
+    if(prose.length===0) return true;
+  }
   return false;
 }
 // primary engine: Google's free endpoint (no key, no daily limit). Falls back to MyMemory.
@@ -216,6 +223,40 @@ async function mtMyMemory(text, sl, tl){
   const tt = j && j.responseData && j.responseData.translatedText;
   if(!tt || /MYMEMORY WARNING|QUOTA|LIMIT/i.test(tt)) throw new Error('mymemory');
   return tt;
+}
+async function mtGoogleRetry(text, sl, tl){
+  for(let a=0; a<4; a++){
+    try{ return await mtGoogle(text, sl, tl); }
+    catch(e){ await new Promise(r=>setTimeout(r, 500*Math.pow(2,a))); }   // 0.5s,1s,2s,4s
+  }
+  return null;
+}
+// Translate MANY strings in ONE request (newline-joined). A 15-page paper drops
+// from ~600 requests to ~30, which is what stopped later pages coming back
+// untranslated. Falls back to one-by-one if the line count doesn't match.
+async function mtBatch(texts, dir){
+  const [sl,tl] = dir==='en_af' ? ['en','af'] : ['af','en'];
+  const out = new Array(texts.length).fill(null);
+  const need=[], needIdx=[];
+  texts.forEach((t,i)=>{
+    const k = sl+tl+'::'+t;
+    if(TCACHE.has(k)) out[i] = TCACHE.get(k).text;
+    else { need.push(t); needIdx.push(i); }
+  });
+  if(!need.length) return out;
+  const res = await mtGoogleRetry(need.join('\n'), sl, tl);
+  if(res!=null){
+    const parts = res.split('\n');
+    if(parts.length === need.length){
+      parts.forEach((p,i)=>{ out[needIdx[i]] = p; TCACHE.set(sl+tl+'::'+need[i], {text:p}); });
+      return out;
+    }
+  }
+  for(let i=0;i<need.length;i++){                    // safety net: one at a time
+    const r = await mtTranslate(need[i], dir);
+    out[needIdx[i]] = r.failed ? null : r.text;
+  }
+  return out;
 }
 async function mtTranslate(text, dir){
   const [sl,tl] = dir==='en_af' ? ['en','af'] : ['af','en'];
@@ -238,6 +279,63 @@ async function translateBlock(srcText, dir){
   if(exact!==null) return {mode:'gloss', text:exact};
   const r = await mtTranslate(trimmed, dir);
   return {mode:'mt', text:r.text, hints:glossaryHints(trimmed,dir), failed:!!r.failed};
+}
+// Translate every unit of a document using batched requests.
+// Returns {total, failed} so the UI can report honestly.
+async function translateAllUnits(units, dir, onProg){
+  const jobs=[];
+  units.forEach(u=>{
+    const src = (u.src!=null ? u.src : u.str) || '';
+    if(u.parts && u.parts.some(p=>p.special)){
+      const outParts=[];
+      u.parts.forEach(p=>{
+        if(p.special || isKeep(p.t)){
+          outParts.push({t:p.t, x:p.x, w:p.w, script:p.script, special:p.special, kept:true}); return;
+        }
+        const lead=(p.t.match(/^\s*/)||[''])[0], trail=(p.t.match(/\s*$/)||[''])[0];
+        const slot={t:p.t, x:p.x, w:p.w, script:null, special:false, kept:false, lead, trail};
+        outParts.push(slot);
+        const g = glossaryExact(p.t.trim(), dir);
+        if(g!==null) slot.t = lead+g+trail;
+        else jobs.push({slot, src:p.t.trim()});
+      });
+      u.tr = {mode:'mt', text:src, parts:outParts, hints:glossaryHints(src,dir)};
+    }else if(isKeep(src)){
+      u.tr = {mode:'keep', text:src};
+    }else{
+      const g = glossaryExact(src.trim(), dir);
+      if(g!==null) u.tr = {mode:'gloss', text:g};
+      else { u.tr = {mode:'mt', text:src, hints:glossaryHints(src,dir)}; jobs.push({unit:u, src:src.trim()}); }
+    }
+  });
+  // group jobs into batches (by count and by characters)
+  const batches=[]; let cur=[], curLen=0;
+  jobs.forEach(j=>{
+    const L = j.src.length + 1;
+    if(cur.length>=25 || curLen+L>1400){ batches.push(cur); cur=[]; curLen=0; }
+    cur.push(j); curLen += L;
+  });
+  if(cur.length) batches.push(cur);
+  let done=0, failed=0;
+  for(const b of batches){
+    const res = await mtBatch(b.map(j=>j.src.replace(/\s*\n\s*/g,' ')), dir);
+    b.forEach((j,i)=>{
+      const t = res[i];
+      if(t==null){ failed++; return; }                       // leave source text
+      if(j.slot) j.slot.t = j.slot.lead + t + j.slot.trail;
+      else j.unit.tr.text = t;
+    });
+    done += b.length;
+    onProg && onProg(done, jobs.length);
+  }
+  // finalise part-based units
+  units.forEach(u=>{
+    if(u.tr && u.tr.parts){
+      u.tr.text = u.tr.parts.map(p=>p.t).join('');
+      u.tr.mode = u.tr.parts.some(p=>!p.kept) ? 'mt' : 'keep';
+    }
+  });
+  return {total:jobs.length, failed};
 }
 // translate a unit that may contain special parts (super/subscript, formulas):
 // normal parts are translated each in their own slot; special parts are kept
@@ -690,15 +788,12 @@ async function handleFiles(files){
     // 4) translate (unit = a PDF line for overlay, or a text block for reflow)
     procNote('Translating…');
     const units = collectUnits(doc);
-    let total=units.length, done=0, failed=0;
-    for(const u of units){
-      u.tr = await translateUnit(u, row.direction);
-      if(u.tr.failed) failed++;
-      done++; setBar(0.5 + (done/Math.max(1,total))*0.5);
-      procNote(`Translating… (${done}/${total})`);
-    }
+    const { total, failed } = await translateAllUnits(units, row.direction, (done,tot)=>{
+      setBar(0.5 + (done/Math.max(1,tot))*0.5);
+      procNote(`Translating… (${done}/${tot})`);
+    });
     procDone('Translation ready for review');
-    if(failed) toast(`${failed} line(s) couldn't be translated automatically — left in the original for you to edit.`,'err');
+    if(failed) toast(`${failed} of ${total} pieces couldn't be translated — left in the original for you to edit.`,'err');
     renderReview();
     setStep('review');
   }catch(e){
@@ -1133,7 +1228,7 @@ window.EPT = { extractDocument, translateBlock, translateUnit, mtTranslate, isKe
   buildDocxFor: async (doc)=>{ CURRENT={_doc:doc, name:'test', id:'test'}; return await buildDocx(); },
   buildOverlayFor: async (doc)=>{ CURRENT={_doc:doc, name:'test', id:'test'}; return await buildOverlayPdf(); },
   buildInplaceFor: async (doc)=>{ CURRENT={_doc:doc, name:'test', id:'test'}; return await buildDocxInplace(); },
-  collectUnits, sanitizePdfText,
+  collectUnits, sanitizePdfText, translateAllUnits, mtBatch,
   setGlossary:(g)=>{ GLOSSARY=g; } };
 
 /* ---------------- boot ---------------- */

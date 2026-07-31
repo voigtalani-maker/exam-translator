@@ -1,5 +1,5 @@
 /* Exam Translator service worker — network-first for app files so redeploys land immediately. */
-const CACHE = 'ext-v8';
+const CACHE = 'ext-v9';
 const SHELL = ['./','./index.html','./styles.css','./app.js','./share.html','./manifest.webmanifest',
   './icon-192.png','./icon-512.png','./icon-maskable-512.png','./apple-touch-icon-180.png'];
 
