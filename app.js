@@ -452,9 +452,21 @@ function groupLines(items, styles){
     const mainSize = Math.max(...(baseItems.length?baseItems:s.items).map(i=>i.size));
     // split into parts: normal text vs super/subscript (smaller and/or offset
     // from the baseline). Special parts keep their ORIGINAL ink — never redrawn.
+    const flag = it => (it.size < mainSize*0.82) || (Math.abs(it.y - baseY) > mainSize*0.12);
+    // right-to-left cascade: short formula tokens (PCℓ, C, F, CO…) directly
+    // before a sub/superscript belong to the formula — keep their original ink
+    const isTok = t => t.trim().length<=8 && /^[\(\[]?\d*[A-ZΔ][A-Za-zℓ]{0,5}[\)\]]?$/.test(t.trim());
+    const eff = new Array(s.items.length);
+    let nextEff = false;
+    for(let i=s.items.length-1;i>=0;i--){
+      const it=s.items[i];
+      if(!it.str.trim()){ eff[i]=false; continue; }         // whitespace: transparent to the cascade
+      eff[i] = flag(it) || (nextEff && isTok(it.str));
+      nextEff = eff[i];
+    }
     const parts=[]; let cur=null;
-    s.items.forEach(it=>{
-      const special = (it.size < mainSize*0.82) || (Math.abs(it.y - baseY) > mainSize*0.12);
+    s.items.forEach((it,idx)=>{
+      const special = !!eff[idx] && !!it.str.trim() ? eff[idx] : (it.str.trim() ? false : (cur?cur.special:false));
       if(cur && cur.special===special){ cur.t+=it.str; cur.right=Math.max(cur.right, it.x+it.w); }
       else { cur={t:it.str, x:it.x, right:it.x+it.w, special}; parts.push(cur); }
     });
@@ -821,11 +833,34 @@ function sanitizePdfText(s){
     .replace(/[\x00-\x1F]/g,' ')
     .replace(/[^\x20-\xFF]/g,'');            // drop anything Helvetica/WinAnsi can't encode
 }
+// full-Unicode fonts (DejaVu) so no character can ever vanish (ℓ, Δ, ⇌, °, ₅ …)
+let UFONT_BYTES = null;
+async function loadUnicodeFonts(pdf){
+  if(!window.fontkit) return null;
+  try{
+    if(!UFONT_BYTES){
+      const base='https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/';
+      const [sans,serif] = await Promise.all([
+        fetch(base+'DejaVuSans.ttf').then(r=>{ if(!r.ok) throw new Error('font'); return r.arrayBuffer(); }),
+        fetch(base+'DejaVuSerif.ttf').then(r=>{ if(!r.ok) throw new Error('font'); return r.arrayBuffer(); })
+      ]);
+      UFONT_BYTES = {sans, serif};
+    }
+    pdf.registerFontkit(fontkit);
+    return { sans:  await pdf.embedFont(UFONT_BYTES.sans,  {subset:true}),
+             serif: await pdf.embedFont(UFONT_BYTES.serif, {subset:true}) };
+  }catch(e){ console.warn('Unicode fonts unavailable, falling back', e); return null; }
+}
 async function buildOverlayPdf(){
   const { PDFDocument, StandardFonts, rgb } = PDFLib;
   const pdf = await PDFDocument.load(CURRENT._doc.bytes);
-  const sans  = await pdf.embedFont(StandardFonts.Helvetica);   // matches Arial/Helvetica papers
-  const serif = await pdf.embedFont(StandardFonts.TimesRoman);  // matches Times/serif papers
+  const uni = await loadUnicodeFonts(pdf);
+  const stdSans  = await pdf.embedFont(StandardFonts.Helvetica);
+  const stdSerif = await pdf.embedFont(StandardFonts.TimesRoman);
+  const sans  = uni ? uni.sans  : stdSans;
+  const serif = uni ? uni.serif : stdSerif;
+  // with Unicode fonts only control chars need cleaning; otherwise full sanitize
+  const clean = uni ? (s=>(s||'').replace(/[\x00-\x1F]/g,' ')) : sanitizePdfText;
   const pages = pdf.getPages();
   CURRENT._doc.pages.forEach(pg=>{
     const page = pages[pg.index-1]; if(!page) return;
@@ -834,14 +869,19 @@ async function buildOverlayPdf(){
       if(tr.mode==='keep' && !tr.edited) return;               // leave numbers/formulas untouched
       if(!tr.edited && (tr.text||'').trim()===ln.str.trim()) return; // translation identical -> original ink stays
       const font = ln.serif ? serif : sans;
+      const stdFont = ln.serif ? stdSerif : stdSans;
       const drawSlot = (text, x, w0, baseSize)=>{            // cover one slot, redraw text inside it
-        text = sanitizePdfText(text); if(!text.trim()) return;
+        const t = clean(text); if(!t.trim()) return;
         page.drawRectangle({ x: x-0.5, y: ln.y - baseSize*0.22, width: w0+1, height: baseSize*1.22, color: rgb(1,1,1) });
-        let size = baseSize || 10;
-        const maxW = Math.max(w0, 6);
-        const w = font.widthOfTextAtSize(text, size);
-        if(w > maxW) size = Math.max(4, size * maxW / w);
-        page.drawText(text, { x, y: ln.y, size, font, color: rgb(0,0,0) });
+        const tryDraw = (f, tt)=>{
+          let size = baseSize || 10;
+          const maxW = Math.max(w0, 6);
+          const w = f.widthOfTextAtSize(tt, size);
+          if(w > maxW) size = Math.max(4, size * maxW / w);
+          page.drawText(tt, { x, y: ln.y, size, font:f, color: rgb(0,0,0) });
+        };
+        try{ tryDraw(font, t); }
+        catch(e){ try{ tryDraw(stdFont, sanitizePdfText(text)); }catch(e2){} }
       };
       if(tr.parts && !tr.edited){
         // per-part: translated words replaced in their own slot; kept/special
@@ -923,18 +963,21 @@ function renderLibrary(){
   rows.forEach(p=>{
     const c=el('div','card paper');
     const dir = p.direction==='en_af'?'EN → AF':'AF → EN';
+    const subjClass = p.subject ? 'subj-'+p.subject.replace(/[^A-Za-z]/g,'') : '';
     c.innerHTML = `
-      <div class="ptitle">${esc(p.name||p.original_filename||'Untitled')}</div>
-      <div class="tags">
-        ${p.subject?`<span class="pill">${esc(p.subject)}</span>`:''}
-        ${p.grade?`<span class="pill grey">Gr ${esc(p.grade)}</span>`:''}
-        ${p.paper_type?`<span class="pill grey">${esc(p.paper_type)}</span>`:''}
-        ${p.exam_period?`<span class="pill grey">${esc(p.exam_period)}</span>`:''}
-        ${p.year?`<span class="pill grey">${esc(p.year)}</span>`:''}
-        <span class="pill grey">${dir}</span>
-        ${p.status==='translated'?'<span class="pill ok">Translated</span>':'<span class="pill warn">Original only</span>'}
-      </div>
-      <div class="meta">Added ${new Date(p.created_at).toLocaleDateString()}</div>`;
+      <div class="pinfo">
+        <div class="ptitle">${esc(p.name||p.original_filename||'Untitled')}</div>
+        <div class="tags">
+          ${p.subject?`<span class="pill ${subjClass}">${esc(p.subject)}</span>`:''}
+          ${p.grade?`<span class="pill grey">Gr ${esc(p.grade)}</span>`:''}
+          ${p.paper_type?`<span class="pill grey">${esc(p.paper_type)}</span>`:''}
+          ${p.exam_period?`<span class="pill period">${esc(p.exam_period)}</span>`:''}
+          ${p.year?`<span class="pill grey">${esc(p.year)}</span>`:''}
+          <span class="pill dir">${dir}</span>
+          ${p.status==='translated'?'<span class="pill ok">Translated</span>':'<span class="pill warn">Original only</span>'}
+        </div>
+        <div class="meta">Added ${new Date(p.created_at).toLocaleDateString()}</div>
+      </div>`;
     const acts=el('div','acts');
     const dlO=el('button','btn ghost sm','⬇ Original');
     dlO.onclick=()=>downloadStored(p.original_path, p.original_filename||'original');
