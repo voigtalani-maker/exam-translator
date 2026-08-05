@@ -207,6 +207,16 @@ function isKeep(text){
   }
   return false;
 }
+// A question number is not language — it must survive the round trip byte for
+// byte. Sent through the engine, "2.2.1 a polar molecule…" came back as
+// "2.2.a polêre molekuul…" and "2.2.6 forms…" as "2.2.f vorm…", silently
+// renumbering the paper. Split the label off, translate only the words, then
+// put the label back exactly as it was.
+const LABEL_RE = /^\s*((?:\d+(?:[.,]\d+)*[.)]?|\([a-zA-Z]\)|\([ivxIVX]+\)|[a-zA-Z][.)])\s+)/;
+function splitLabel(s){
+  const m = (s||'').match(LABEL_RE);
+  return m ? { prefix: m[1], rest: s.slice(m[0].length) } : { prefix: '', rest: s||'' };
+}
 // primary engine: Google's free endpoint (no key, no daily limit). Falls back to MyMemory.
 async function mtGoogle(text, sl, tl){
   const u = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${tl}&dt=t&q=${encodeURIComponent(text)}`;
@@ -297,7 +307,10 @@ async function translateAllUnits(units, dir, onProg){
         outParts.push(slot);
         const g = glossaryExact(p.t.trim(), dir);
         if(g!==null) slot.t = lead+g+trail;
-        else jobs.push({slot, src:p.t.trim()});
+        else {
+          const {prefix, rest} = splitLabel(p.t.trim());
+          if(rest.trim()) jobs.push({slot, prefix, src:rest.trim()});
+        }
       });
       u.tr = {mode:'mt', text:src, parts:outParts, hints:glossaryHints(src,dir)};
     }else if(isKeep(src)){
@@ -305,7 +318,11 @@ async function translateAllUnits(units, dir, onProg){
     }else{
       const g = glossaryExact(src.trim(), dir);
       if(g!==null) u.tr = {mode:'gloss', text:g};
-      else { u.tr = {mode:'mt', text:src, hints:glossaryHints(src,dir)}; jobs.push({unit:u, src:src.trim()}); }
+      else {
+        u.tr = {mode:'mt', text:src, hints:glossaryHints(src,dir)};
+        const {prefix, rest} = splitLabel(src.trim());
+        if(rest.trim()) jobs.push({unit:u, prefix, src:rest.trim()});
+      }
     }
   });
   // group jobs into batches (by count and by characters)
@@ -322,8 +339,9 @@ async function translateAllUnits(units, dir, onProg){
     b.forEach((j,i)=>{
       const t = res[i];
       if(t==null){ failed++; return; }                       // leave source text
-      if(j.slot) j.slot.t = j.slot.lead + t + j.slot.trail;
-      else j.unit.tr.text = t;
+      const full = (j.prefix || '') + t;                     // question number restored verbatim
+      if(j.slot) j.slot.t = j.slot.lead + full + j.slot.trail;
+      else j.unit.tr.text = full;
     });
     done += b.length;
     onProg && onProg(done, jobs.length);
@@ -335,7 +353,35 @@ async function translateAllUnits(units, dir, onProg){
       u.tr.mode = u.tr.parts.some(p=>!p.kept) ? 'mt' : 'keep';
     }
   });
+  units.forEach(u=>{ if(u._para) spreadParagraph(u); });
   return {total:jobs.length, failed};
+}
+// Lay a translated paragraph back across the rows it came from. Each row gets a
+// share of the words proportional to how wide that row is in the original, so
+// the shape of the paragraph survives. Rows that end up empty (Afrikaans came
+// out shorter) are still covered — otherwise the English underneath shows
+// through the gap.
+function spreadParagraph(u){
+  const lines = u._para;
+  const text  = ((u.tr && u.tr.text) || u.src || '').trim();
+  const mode  = (u.tr && u.tr.mode) || 'mt';
+  const widths = lines.map(l=>Math.max(l.width||1, 1));
+  const total  = widths.reduce((a,b)=>a+b, 0);
+  const quota  = widths.map(w=>Math.max(1, Math.round(text.length * w / total)));
+  const buckets = lines.map(()=>[]);
+  let li = 0, used = 0;
+  text.split(/\s+/).filter(Boolean).forEach(word=>{
+    while(li < lines.length-1 && used > 0 && used + 1 + word.length > quota[li]){ li++; used = 0; }
+    buckets[li].push(word); used += (used ? 1 : 0) + word.length;
+  });
+  // Translation came back identical to the source (engine failed, or the text is
+  // already in the target language): keep the original ink rather than stamping
+  // the same English back on top of itself at a different size.
+  const unchanged = text === (u.src||'').trim();
+  lines.forEach((l,i)=>{
+    l.tr = { mode: unchanged ? 'keep' : mode, text: unchanged ? l.str : buckets[i].join(' '),
+             cover: !unchanged, hints: i===0 && u.tr ? u.tr.hints : null };
+  });
 }
 // translate a unit that may contain special parts (super/subscript, formulas):
 // normal parts are translated each in their own slot; special parts are kept
@@ -690,10 +736,45 @@ async function buildDocxInplace(){
   }
   return await zip.generateAsync({ type:'blob', mimeType:'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
 }
+// A PDF "line" is a visual row, not a sentence. Translating each row on its own
+// gave the engine no context and produced real howlers: "If you run / out of
+// space" came back as "As jy hardloop / sonder spasie" (run = jog), and a row
+// starting mid-sentence turned "corresponding to the letter" into the verb
+// "ooreenstem met die letter". So we stitch consecutive prose rows back into a
+// paragraph, translate that, and lay the result back out over the same rows.
+// Rows carrying formulas, sub/superscripts or bare labels are left alone — they
+// keep the existing per-row path and their original ink.
+function groupParagraphLines(lines){
+  const groups=[]; let cur=null;
+  const flush=()=>{ if(cur){ groups.push(cur); cur=null; } };
+  const isProse = l => !(l.parts && l.parts.some(p=>p.special)) && !isKeep(l.str)
+                       && (l.str.match(/[A-Za-zÀ-ÿ]{2,}/g)||[]).length >= 2;
+  lines.forEach(l=>{
+    if(!isProse(l)){ flush(); groups.push([l]); return; }
+    if(cur){
+      const prev = cur[cur.length-1];
+      const gap = prev.y - l.y;                                  // rows run top-to-bottom
+      const flows   = gap > 0 && gap < prev.size*2.2;            // next row, not a new block
+      const aligned = Math.abs(l.x - prev.x) < prev.size*0.9;    // same left margin
+      const sameSize= Math.abs((l.size||0) - (prev.size||0)) < 0.6;
+      const prevEnd = /[.:;?!”"')\]]\s*$/.test(prev.str);        // previous row finished a sentence
+      const newItem = LABEL_RE.test(l.str);                      // "1.2 …" starts a new question
+      if(flows && aligned && sameSize && !prevEnd && !newItem){ cur.push(l); return; }
+    }
+    flush(); cur=[l];
+  });
+  flush();
+  return groups;
+}
 // flat list of translation units (each has .src and receives .tr) across any doc mode
 function collectUnits(doc){
   const u=[];
-  if(doc.mode==='pdf-overlay') doc.pages.forEach(p=>p.lines.forEach(l=>{ l.src=l.str; u.push(l); }));
+  if(doc.mode==='pdf-overlay') doc.pages.forEach(p=>{
+    groupParagraphLines(p.lines).forEach(g=>{
+      if(g.length===1){ g[0].src = g[0].str; u.push(g[0]); return; }
+      u.push({ src: g.map(l=>l.str.trim()).join(' '), _para: g });
+    });
+  });
   else if(doc.mode==='docx-inplace') doc.parts.forEach(p=>p.segments.forEach(s=>u.push(s)));
   else doc.pages.forEach(p=>p.blocks.forEach(b=>{ if(b.type==='text'){ b.src=runsToText(b.runs); u.push(b); } }));
   return u;
@@ -938,15 +1019,35 @@ async function buildDocx(){
   return await D.Packer.toBlob(doc);
 }
 // ---- PDF overlay: keep original page, cover each translated line, redraw in place ----
+// Smallest point size we will ever draw. Below roughly this a matric learner
+// simply cannot read the paper, so we accept a slight overhang instead.
+const MIN_PDF_FONT = 6.5;
+// Characters that are NOT Latin-1 but appear all over exam papers. Without an
+// entry here they used to be deleted outright by the final drop below — that is
+// how "Paper II – Chemistry" shipped as "Vraestel II  Chemie" and
+// "3,9 – 4,6 sekondes" lost its dash. Every one of these now degrades to a
+// visible ASCII stand-in instead of vanishing.
+const PDF_TRANSLIT = [
+  [/[–—‐‑‒−]/g, '-'], [/[’‘‚‛]/g, "'"], [/[“”„‟]/g, '"'],
+  [/…/g, '...'], [/[•·∙]/g, '-'], [/[     ]/g, ' '],
+  [/[✗✘☓⨯]/g, 'X'], [/[✓✔]/g, 'v'],
+  [/[⇌⇄⇋]/g, '<=>'], [/[↔⟷]/g, '<->'], [/[→⟶⇒]/g, '->'], [/[←⟵⇐]/g, '<-'],
+  [/ℓ/g, 'l'], [/[≈∼]/g, '~'], [/≤/g, '<='], [/≥/g, '>='], [/≠/g, '=/='],
+  [/[Δ∆]/g, 'D'], [/[Σ∑]/g, 'S'], [/√/g, 'sqrt'], [/∞/g, 'inf'],
+  [/[₀-₉]/g, c=>String.fromCharCode(c.charCodeAt(0)-0x2050)],  // ₀-₉ -> 0-9
+  [/⁰/g, '0'], [/¹/g, '1'], [/²/g, '2'], [/³/g, '3'],
+  [/[⁴-⁹]/g, c=>String.fromCharCode(c.charCodeAt(0)-0x2040)],
+  [/⁺/g, '+'], [/⁻/g, '-'], [/[−]/g, '-']
+];
+// characters we could not encode, so the export can warn instead of losing them silently
+let PDF_DROPPED = new Set();
 function sanitizePdfText(s){
   // °C, ×, ÷, ², ³, ±, é, ë … are all WinAnsi-encodable — keep them exactly.
-  return (s||'')
-    .replace(/[₀-₉]/g, c=>String.fromCharCode(c.charCodeAt(0)-0x2050)) // ₀-₉ -> 0-9
-    .replace(/⁰/g,'0').replace(/[⁴-⁹]/g, c=>String.fromCharCode(c.charCodeAt(0)-0x2040)) // ⁰,⁴-⁹
-    .replace(/→/g,'->').replace(/←/g,'<-')
-    .replace(/[Δ∆]/g,'D')                    // only hits the flat fallback; kept parts keep original ink
-    .replace(/[\x00-\x1F]/g,' ')
-    .replace(/[^\x20-\xFF]/g,'');            // drop anything Helvetica/WinAnsi can't encode
+  let t = (s||'');
+  for(const [re, to] of PDF_TRANSLIT) t = t.replace(re, to);
+  t = t.replace(/[\x00-\x1F]/g,' ');
+  t = t.replace(/[^\x20-\xFF]/g, c=>{ PDF_DROPPED.add(c); return ''; });
+  return t;
 }
 // full-Unicode fonts (DejaVu) so no character can ever vanish (ℓ, Δ, ⇌, °, ₅ …)
 let UFONT_BYTES = null;
@@ -976,6 +1077,8 @@ async function buildOverlayPdf(){
   const serif = uni ? uni.serif : stdSerif;
   // with Unicode fonts only control chars need cleaning; otherwise full sanitize
   const clean = uni ? (s=>(s||'').replace(/[\x00-\x1F]/g,' ')) : sanitizePdfText;
+  PDF_DROPPED = new Set();
+  if(!uni) console.warn('Unicode fonts unavailable — exporting with WinAnsi transliteration.');
   const pages = pdf.getPages();
   CURRENT._doc.pages.forEach(pg=>{
     const page = pages[pg.index-1]; if(!page) return;
@@ -990,13 +1093,19 @@ async function buildOverlayPdf(){
       // otherwise everything shrinks unnecessarily.
       const pickFont = t => { try{ stdFont.widthOfTextAtSize(t, 10); return stdFont; }catch(e){ return font; } };
       const drawSlot = (text, x, w0, baseSize)=>{            // cover one slot, redraw text inside it
-        const t = clean(text); if(!t.trim()) return;
-        page.drawRectangle({ x: x-0.5, y: ln.y - baseSize*0.22, width: w0+1, height: baseSize*1.22, color: rgb(1,1,1) });
+        const t = clean(text);
+        const cover = ()=> page.drawRectangle({ x: x-0.5, y: ln.y - baseSize*0.22, width: w0+1, height: baseSize*1.22, color: rgb(1,1,1) });
+        // A re-flowed paragraph row can legitimately end up empty; it still has
+        // to be covered or the original English shows through the gap.
+        if(!t.trim()){ if(tr.cover) cover(); return; }
+        cover();
         const tryDraw = (f, tt)=>{
           let size = baseSize || 10;
           const maxW = Math.max(w0, 6);
           const w = f.widthOfTextAtSize(tt, size);
-          if(w > maxW) size = Math.max(4, size * maxW / w);
+          // Shrink to fit, but never below MIN_PDF_FONT — a 4pt line is
+          // unreadable, which is worse for a learner than a little overhang.
+          if(w > maxW) size = Math.max(MIN_PDF_FONT, size * maxW / w);
           page.drawText(tt, { x, y: ln.y, size, font:f, color: rgb(0,0,0) });
         };
         try{ tryDraw(pickFont(t), t); }
@@ -1007,6 +1116,10 @@ async function buildOverlayPdf(){
         // line so nothing gaps when the translation has a different length.
         // Sub/superscripts are redrawn as real scripts (smaller + offset), so
         // C₂H₆ and 10² come out correctly.
+        // Nothing on this line actually changed (translation came back identical,
+        // or every part was kept) → leave the original ink alone. Redrawing it
+        // only re-stamped the SAME English at a shrunken size on top of itself.
+        if(tr.parts.every(p=>p.kept) || (tr.text||'').trim()===ln.str.trim()) return;
         const S = ln.size || 10;
         const rightEdge = Math.max(ln.x + ln.width, ...tr.parts.map(p=>p.x + p.w));
         const yTop = Math.max(ln.y + S*0.86, (ln.yMax!=null?ln.yMax:ln.y) + S*0.55);
@@ -1021,7 +1134,10 @@ async function buildOverlayPdf(){
         }).filter(i=>i.t.length);
         const total = seq.reduce((a,i)=>a+i.w, 0);
         const maxW = Math.max(rightEdge - ln.x, 6);
-        const k = total > maxW ? maxW/total : 1;
+        // same legibility floor as drawSlot: squeezing a whole line down to 4pt
+        // made axis labels and table cells impossible to read
+        const kMin = Math.min(1, MIN_PDF_FONT / S);
+        const k = Math.max(total > maxW ? maxW/total : 1, kMin);
         let cx = ln.x;
         seq.forEach(i=>{
           const size = i.size*k;
@@ -1061,7 +1177,10 @@ async function exportTranslated(){
     downloadBlob(blob, fname);
     CURRENT._lastBlob = blob;
     setStep('export');
-    toast('Saved to library','ok');
+    // never lose a character quietly — if something still could not be drawn, say so
+    if(overlay && PDF_DROPPED.size)
+      toast('Saved, but these characters could not be printed: '+[...PDF_DROPPED].join(' '),'err');
+    else toast('Saved to library','ok');
   }catch(e){ console.error(e); toast('Export failed: '+(e.message||e),'err'); }
   finally{ $('#exportBtn').disabled=false; $('#exportBtn').textContent=label; }
 }
